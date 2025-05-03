@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+SQLAlchemy
+alembic
+asyncpg
+python-dotenv
+passlib[bcrypt]  # for password hashing
+pyjwt  # for JWT authentication

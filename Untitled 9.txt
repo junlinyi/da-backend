@@ -1,0 +1,117 @@
+"""
+Writes user-level metrics and loads to BigQuery that will be displayed in Grafana
+and alerted on via Grafana ad the Flowrida DAG measurement_incrementality_optimization_monitoring.
+
+Sample command (PICA) staging:
+python -m tiam_ml --runner DataflowRunner --job io-user-level-metrics-monitoring --project sc-measurement --environment staging --date_hour 2024060600
+Sample command (PICA) prod:
+python -m tiam_ml --runner DataflowRunner --job io-user-level-metrics-monitoring --project sc-measurement --environment prod --date_hour 2024060600
+"""
+
+from datetime import datetime
+from typing import List
+from apache_beam.runners import PipelineState
+from apps.measurement.user_incrementality.constants.common_environment import (
+    MEASUREMENT_PROJECT,
+    INCREMENTALITY_OPTIMIZATION_MONITORING_TABLE,
+    INCREMENTALITY_OPTIMIZATION_USER_LEVEL_METRICS_INPUT_TABLE,
+    USER_INCREMENTALITY_PITE_CUSTOM_AUDIENCE,
+)
+from apps.measurement.user_incrementality.helpers.pite_custom_audience_job_controller import (
+    get_inference_row_id_with_latest_user_assignment_table_for_io,
+      get_live_incrementality_optimization_pica_requests,
+)
+from apps.measurement.user_incrementality.jobs import (
+    UserIncrementalityJobBase,
+    load_jinja_template,
+)
+from google.cloud import bigquery
+from tiam_ml.common import JobType
+from tiam_ml.utils import bq_utils
+from tiam_ml.utils.bq_utils import std_dest_format
+
+
+class IncrementalityOptimizationMonitorUserLevelMetrics(UserIncrementalityJobBase):        
+
+    def __init__(self, opts):
+        super().__init__(opts)
+        self.incrementality_optimization_monitoring_table = std_dest_format.format(
+            project=MEASUREMENT_PROJECT,
+            dataset=USER_INCREMENTALITY_PITE_CUSTOM_AUDIENCE,
+            table_type=INCREMENTALITY_OPTIMIZATION_MONITORING_TABLE,
+        )
+
+    @property
+    def job_type(self) -> JobType:
+        return JobType.SCRIPT_JOB
+    
+    # gets latest PITE score metrics input table
+    def get_latest_io_user_level_metrics_input_table(self, pica_job_id: str):
+        inference_row_id = get_inference_row_id_with_latest_user_assignment_table_for_io(
+            pite_custom_audience_job_id=pica_job_id,
+            env=self.environment,
+        )
+        assert inference_row_id is not None, self.logger.error(f"No inference row ID could be found for {pica_job_id}!")
+        
+        latest_user_level_metrics_input_table = std_dest_format.format(
+            project=self.project,
+            dataset=USER_INCREMENTALITY_PITE_CUSTOM_AUDIENCE,
+            table_type=INCREMENTALITY_OPTIMIZATION_USER_LEVEL_METRICS_INPUT_TABLE.format(inference_row_id=inference_row_id),
+        )
+        if bq_utils.table_exist(project=self.project, table_id=latest_user_level_metrics_input_table):
+            self.logger.info(f"The latest metrics input table for {pica_job_id} is {latest_user_level_metrics_input_table}")
+            return latest_user_level_metrics_input_table
+        else:
+            self.logger.error(f"The table {latest_user_level_metrics_input_table} is missing!")
+            return PipelineState.FAILED
+
+    # prepares latest PITE score metrics for dashboard and alerting
+    def emit_user_level_metrics_for_monitoring(self, pica_job_ids: List[str]):
+        user_level_metrics_monitoring_sqls = []
+        for pica_job_id in pica_job_ids:
+            user_level_metrics_monitoring_sql = load_jinja_template("io_emit_user_level_metrics_for_monitoring.sql.j2").render(
+                latest_user_level_metrics_input_table=self.get_latest_io_user_level_metrics_input_table(pica_job_id),
+                io_monitoring_table=std_dest_format.format(
+                    project=self.project,
+                    dataset=USER_INCREMENTALITY_PITE_CUSTOM_AUDIENCE,
+                    table_type=INCREMENTALITY_OPTIMIZATION_MONITORING_TABLE,
+                ),
+                execution_timestamp=datetime.strftime(datetime.strptime(self.options.date_hour, "%Y%m%d%H"), "%Y-%m-%dT%H:00:00"),
+                pica_request_name=self.options.name,
+                pica_request_ad_account_id=self.options.segment_ad_account_id,
+                pica_request_conversion_request=self.options.conversion_source,
+                pica_request_primary_event_type=self.options.event_type,
+                pica_request_primary_value_type=self.options.primary_value_type,
+                pica_request_countries=self.options.mau_countries,
+                pica_request_model_id=self.options.model_id,
+                pica_request_model_suffix=self.options.model_suffix,
+            )
+            user_level_metrics_monitoring_sqls.append(user_level_metrics_monitoring_sql)
+
+        final_monitoring_sql = " UNION ALL ".join(user_level_metrics_monitoring_sqls)
+        self.logger.info(f"Executing BigQuery SQL for user-level metrics monitoring {final_monitoring_sql}")
+
+        # TODO: add validation on this table, should have inserted 5 rows exactly
+        partition_timestamp = self.options.date_hour
+        destination_table = f"{self.incrementality_optimization_monitoring_table}${partition_timestamp}"
+        job_config = job_config = bigquery.QueryJobConfig(
+            destination=destination_table,
+            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE
+        )
+        client = bigquery.Client()
+        query_job = client.query(final_monitoring_sql, job_config=job_config)
+        query_job.result()  # Wait for the job to complete
+
+        self.logger.info(f"Emitting raw and calibrated PITE score metrics to {self.incrementality_optimization_monitoring_table}")
+
+    def execute(self) -> PipelineState:
+        live_pica_requests = get_live_incrementality_optimization_pica_requests(self.environment)
+        if not live_pica_requests:
+            self.logger.info("######## No live PICA requests, skipping... ########")
+            return PipelineState.DONE
+        
+        pica_job_ids = [request.id for request in live_pica_requests]
+        self.emit_user_level_metrics_for_monitoring(pica_job_ids)
+            
+        return PipelineState.DONE
+    
