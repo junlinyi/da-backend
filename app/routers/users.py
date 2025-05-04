@@ -3,10 +3,10 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from database import DATABASE_URL, get_db
-from models import User
-from schemas import UserResponse, UserUpdate
-from dependencies import verify_firebase_token
+from app.database import DATABASE_URL, get_db
+from app.models import User
+from app.schemas import UserResponse, UserUpdate
+from app.dependencies import verify_firebase_token
 
 router = APIRouter()
 
