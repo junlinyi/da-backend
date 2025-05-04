@@ -1,16 +1,17 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from services.matchmaking import find_matches
-from database import get_db
-from models import User, Swipe
-from schemas import SwipeCreate, UserResponse
-from dependencies import verify_firebase_token
-from services.match_creation import create_match_in_firestore
+from app.services.matchmaking import find_matches
+from app.database import get_db
+from app.models import User, Swipe
+from app.schemas import SwipeCreate, UserResponse
+from app.dependencies import verify_firebase_token
+from app.services.match_creation import create_match_in_firestore
+from typing import List
 
 router = APIRouter()
 
-@router.get("/{user_id}/matches", response_model=list[UserResponse])
+@router.get("/{user_id}/matches", response_model=List[UserResponse])
 async def get_matches(user_id: int, db: AsyncSession = Depends(get_db)):
     matches = await find_matches(user_id, db)
 

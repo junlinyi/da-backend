@@ -2,7 +2,7 @@
 
 from fastapi import Depends, HTTPException, status, Request
 from firebase_admin import auth
-from firebase import firebase_admin
+from app.firebase import firebase_admin
 
 def verify_firebase_token(request: Request):
     auth_header = request.headers.get("Authorization")
