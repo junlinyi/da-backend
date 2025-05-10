@@ -13,8 +13,9 @@ app.add_middleware(
         "http://localhost:3000",
         "http://127.0.0.1:3000",
         "exp://localhost:19000",
-        "exp://192.168.1.76:8081",  # Add your Expo development server URL
-        "http://localhost:8081",     # Add web development server URL
+        "exp://localhost:8081",
+        "http://localhost:8081",
+        "http://127.0.0.1:8081",
     ],
     allow_credentials=True,
     allow_methods=["*"],

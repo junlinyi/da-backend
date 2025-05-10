@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "@miblanchard/react-native-slider": "^2.6.0"
+  }
+}
