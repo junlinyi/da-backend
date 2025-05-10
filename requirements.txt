@@ -11,3 +11,4 @@ psycopg2-binary>=2.9.0  # Required for Alembic migrations
 pydantic>=1.8.0  # Required for FastAPI models
 python-multipart>=0.0.5  # Required for form data handling
 email-validator>=1.1.3  # Required for EmailStr validation
+greenlet>=3.0.0  # Required for SQLAlchemy async functionality
