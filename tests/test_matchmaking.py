@@ -8,7 +8,7 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 cred_path = os.getenv(
     "FIREBASE_CREDENTIAL_PATH",
-    str(project_root / "facedate-6616e-firebase-adminsdk.json")
+    str(project_root / "facedate-6616e-ebf102022977.json")
 )
 cred = credentials.Certificate(cred_path)
 initialize_app(cred)

@@ -11,7 +11,7 @@ project_root = Path(__file__).parent.parent
 # Set the default path relative to the project root
 cred_path = os.getenv(
     "FIREBASE_CREDENTIAL_PATH",
-    str(project_root / "facedate-6616e-firebase-adminsdk.json")
+    str(project_root / "facedate-6616e-ebf102022977.json")
 )
 
 if not firebase_admin._apps:

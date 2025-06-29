@@ -35,6 +35,23 @@ async def get_my_profile(decoded_token=Depends(verify_firebase_token), db: Async
 
     return user
 
+@router.get("/firebase/{firebase_uid}")
+async def get_user_by_firebase_uid(firebase_uid: str, db: AsyncSession = Depends(get_db)):
+    """
+    Get user by Firebase UID (for iOS app to fetch user details)
+    """
+    result = await db.execute(select(User).where(User.firebase_uid == firebase_uid))
+    user = result.scalars().first()
+    
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Return minimal user data for conversation display
+    return {
+        "name": user.name or "Unknown User",
+        "profile_image_url": user.profile_image_url
+    }
+
 @router.put("/me/profile", response_model=UserResponse)
 async def update_profile(
     profile: ProfileUpdate,

@@ -40,7 +40,7 @@ def calculate_match_score(user1: User, user2: User) -> float:
 async def find_matches(
     user_id: int, 
     db: AsyncSession, 
-    max_distance_km: float = 50,
+    max_distance_km: float = None,
     min_match_score: float = 0.3
 ) -> List[Tuple[User, float]]:
     """
@@ -53,23 +53,38 @@ async def find_matches(
     if not current_user:
         return []
 
-    # Get potential matches based on basic criteria
+    # Use user's max_distance_km if not provided
+    if max_distance_km is None:
+        max_distance_km = current_user.max_distance_km or 32
+
+    # Get potential matches based on basic criteria - ENHANCED FILTERING
     base_query = select(User).where(
         User.id != user_id,  # Exclude current user
         User.gender.in_([current_user.preferred_gender, "any"]),  # Gender preference
-        User.age.between(current_user.min_age_preference, current_user.max_age_preference)
+        User.age.between(current_user.min_age_preference, current_user.max_age_preference),
+        # ADDITIONAL FILTERS: Ensure complete profiles only
+        User.name.is_not(None),  # Must have a name
+        User.age.is_not(None),   # Must have an age
+        User.gender.is_not(None), # Must have a gender
+        User.latitude.is_not(None), # Must have location
+        User.longitude.is_not(None)
     )
     
     # Fetch all potential matches
     result = await db.execute(base_query)
     potential_matches = result.scalars().all()
     
+    print(f"🔍 Found {len(potential_matches)} potential matches for user {current_user.name} (ID: {user_id})")
+    
     # Filter by distance and calculate match scores
     matches_with_scores = []
     for match in potential_matches:
-        # Skip if location data is missing
+        print(f"  📋 Checking match: {match.name} (ID: {match.id}, Age: {match.age}, Gender: {match.gender})")
+        
+        # Skip if location data is missing (double-check)
         if not all([current_user.latitude, current_user.longitude, 
                    match.latitude, match.longitude]):
+            print(f"    ❌ Skipping {match.name} - missing location data")
             continue
             
         # Calculate distance
@@ -79,6 +94,7 @@ async def find_matches(
         
         # Skip if too far
         if distance > max_distance_km:
+            print(f"    ❌ Skipping {match.name} - too far ({distance:.2f} km > {max_distance_km} km)")
             continue
             
         # Calculate match score
@@ -86,9 +102,16 @@ async def find_matches(
         
         # Only include matches above minimum score
         if match_score >= min_match_score:
+            print(f"    ✅ {match.name} - Score: {match_score}, Distance: {distance:.2f} km")
             matches_with_scores.append((match, match_score))
+        else:
+            print(f"    ❌ Skipping {match.name} - score too low ({match_score} < {min_match_score})")
     
     # Sort by match score (highest first)
     matches_with_scores.sort(key=lambda x: x[1], reverse=True)
+    
+    print(f"🎯 Final matches for {current_user.name}: {len(matches_with_scores)} users")
+    for match, score in matches_with_scores:
+        print(f"  🏆 {match.name} (ID: {match.id}) - Score: {score}")
     
     return matches_with_scores
