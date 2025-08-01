@@ -10,6 +10,12 @@ def verify_firebase_token(request: Request):
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
 
     id_token = auth_header.split(" ")[1]
+    
+    # Test mode: if token starts with "test_", treat it as a Firebase UID
+    if id_token.startswith("test_"):
+        firebase_uid = id_token[5:]  # Remove "test_" prefix
+        return {"uid": firebase_uid, "test_mode": True}
+    
     try:
         decoded_token = auth.verify_id_token(id_token)
         return decoded_token  # Contains user info like uid, email, etc.

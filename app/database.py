@@ -33,5 +33,8 @@ async def get_db():
 
 # Dependency to get the sync database session
 def get_db_sync():
-    with SyncSessionLocal() as session:
+    session = SyncSessionLocal()
+    try:
         yield session
+    finally:
+        session.close()

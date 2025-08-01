@@ -1,12 +1,13 @@
 # app/routers/users.py
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Body
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from app.database import DATABASE_URL, get_db
 from app.models import User
 from app.schemas import UserResponse, UserUpdate, ProfileUpdate, PreferencesUpdate
 from app.dependencies import verify_firebase_token
+from pydantic import BaseModel
 import logging
 
 # Set up logging
@@ -14,6 +15,40 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+class UserCreateRequest(BaseModel):
+    firebase_uid: str
+    email: str
+    name: str = None
+    bio: str = None
+    age: int = None
+    gender: str = None
+    interests: str = None  # Will be converted to array
+    location: str = None
+    latitude: float = None
+    longitude: float = None
+    state: str = None
+    preferred_gender: str = None
+    min_age_preference: int = None
+    max_age_preference: int = None
+    max_distance_km: int = None
+    profile_image_url: str = None
+    additional_image_urls: str = None  # Will be converted to array
+    timezone: str = None
+    
+    def to_user_dict(self):
+        """Convert to dict with proper array fields for User model"""
+        data = self.dict(exclude_unset=True)
+        
+        # Convert interests string to array
+        if data.get('interests'):
+            data['interests'] = [interest.strip() for interest in data['interests'].split(',') if interest.strip()]
+        
+        # Convert additional_image_urls string to array
+        if data.get('additional_image_urls'):
+            data['additional_image_urls'] = [url.strip() for url in data['additional_image_urls'].split(',') if url.strip()]
+        
+        return data
 
 @router.get("/me", response_model=UserResponse)
 async def get_my_profile(decoded_token=Depends(verify_firebase_token), db: AsyncSession = Depends(get_db)):
@@ -133,3 +168,30 @@ async def delete_account(user_id: int, db: AsyncSession = Depends(get_db)):
     await db.delete(user)
     await db.commit()
     return {"message": "User deleted successfully"}
+
+@router.post("/create", response_model=UserResponse)
+async def create_user(
+    user: UserCreateRequest = Body(...),
+    db: AsyncSession = Depends(get_db)
+):
+    logger.info(f"[USER CREATE] Attempting to create/update user: {user.firebase_uid} {user.email}")
+    try:
+        result = await db.execute(select(User).where(User.firebase_uid == user.firebase_uid))
+        db_user = result.scalars().first()
+        if db_user:
+            logger.info(f"[USER CREATE] User already exists, updating: {db_user.id}")
+            user_data = user.to_user_dict()
+            for key, value in user_data.items():
+                setattr(db_user, key, value)
+        else:
+            user_data = user.to_user_dict()
+            db_user = User(**user_data)
+            db.add(db_user)
+            logger.info(f"[USER CREATE] New user will be created: {user.firebase_uid}")
+        await db.commit()
+        await db.refresh(db_user)
+        logger.info(f"[USER CREATE] User created/updated successfully: {db_user.id}")
+        return db_user
+    except Exception as e:
+        logger.error(f"[USER CREATE] Error creating/updating user: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to create/update user: {e}")
