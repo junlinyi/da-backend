@@ -997,13 +997,29 @@ async def update_default_availability(
             if key not in unique_slots:
                 unique_slots[key] = slot
         
-        # Insert deduplicated availability slots
+        # Insert deduplicated availability slots with validation
         for slot in unique_slots.values():
+            # Validate day_of_week is in correct range (0-6, Sunday=0)
+            day_of_week = slot.get("day_of_week")
+            if day_of_week is None or day_of_week < 0 or day_of_week > 6:
+                logger.warning(f"Invalid day_of_week: {day_of_week}, skipping slot")
+                continue
+                
+            # Validate hour and minute
+            hour = slot.get("hour")
+            minute = slot.get("minute")
+            if hour is None or hour < 0 or hour > 23:
+                logger.warning(f"Invalid hour: {hour}, skipping slot")
+                continue
+            if minute is None or minute not in [0, 30]:
+                logger.warning(f"Invalid minute: {minute}, skipping slot")
+                continue
+                
             availability_slot = UserDefaultAvailability(
                 user_id=user_id,
-                day_of_week=slot.get("day_of_week"),
-                hour=slot.get("hour"),
-                minute=slot.get("minute"),
+                day_of_week=day_of_week,
+                hour=hour,
+                minute=minute,
                 is_available=slot.get("is_available", True)  # <-- FIXED: use frontend value!
             )
             db.add(availability_slot)
@@ -1025,7 +1041,8 @@ async def update_default_availability(
 @router.get("/availability/override")
 async def get_override_availability(
     user_id: int = Query(..., description="User ID"),
-    week_start_date: str = Query(..., description="Week start date (YYYY-MM-DD)"),
+    week_start_date: str = Query(None, description="Week start date (YYYY-MM-DD)"),
+    start_date: str = Query(None, description="Rolling start date (YYYY-MM-DD)"),
     db: AsyncSession = Depends(get_db)
 ):
     """Get user's override availability for a specific week (iOS app compatibility)"""
@@ -1036,9 +1053,20 @@ async def get_override_availability(
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
         
-        # Parse week start date
+        # Determine the date range to query
         from datetime import datetime
-        week_start = datetime.strptime(week_start_date, "%Y-%m-%d").date()
+        if start_date:
+            # Rolling 7 days starting from the provided start_date
+            query_start = datetime.strptime(start_date, "%Y-%m-%d").date()
+            logger.info(f"Using rolling start_date: {start_date} (rolling 7 days)")
+        elif week_start_date:
+            # Traditional week start (backward compatibility)
+            query_start = datetime.strptime(week_start_date, "%Y-%m-%d").date()
+            logger.info(f"Using week_start_date: {week_start_date}")
+        else:
+            raise HTTPException(status_code=400, detail="Either week_start_date or start_date parameter is required")
+        
+        query_end = query_start + timedelta(days=7)
         
         # Query actual override availability from database
         from app.models import UserAvailabilityOverride
@@ -1046,38 +1074,58 @@ async def get_override_availability(
             select(UserAvailabilityOverride)
             .where(
                 UserAvailabilityOverride.user_id == user_id,
-                UserAvailabilityOverride.date >= week_start,
-                UserAvailabilityOverride.date < week_start + timedelta(days=7)
+                UserAvailabilityOverride.date >= query_start,
+                UserAvailabilityOverride.date < query_end
             )
             .order_by(UserAvailabilityOverride.date, UserAvailabilityOverride.start_time)
         )
         override_slots = override_result.scalars().all()
         
         # Convert to When2Meet-style time slots format expected by iOS app
+        # Generate ALL possible slots for the 7-day period and populate with override data
         time_slots = []
-        for slot in override_slots:
-            # Convert date back to day_of_week
-            day_of_week = slot.date.weekday()
-            # Convert time to hour and minute
-            hour = slot.start_time.hour
-            minute = slot.start_time.minute
-            time_slots.append({
-                "id": slot.id,
-                "date": slot.date.isoformat(),
-                "start_time": slot.start_time.strftime("%H:%M"),
-                "end_time": slot.end_time.strftime("%H:%M"),
-                "day_of_week": day_of_week,
-                "hour": hour,
-                "minute": minute,
-                "is_available": True,  # Override slots are always available
-                "is_override": True  # Override slots are always overrides
-            })
         
-        logger.info(f"Retrieved {len(time_slots)} override availability slots for user {user_id} week {week_start_date}")
+        # Create a lookup for existing override slots
+        override_lookup = {}
+        for slot in override_slots:
+            # Convert date to day_of_week relative to query_start
+            days_from_start = (slot.date - query_start).days
+            if 0 <= days_from_start < 7:  # Only include slots within our 7-day range
+                key = f"{days_from_start}_{slot.start_time.hour}_{slot.start_time.minute}"
+                override_lookup[key] = True  # Mark this slot as available
+        
+        # Generate all possible slots for the 7-day period
+        for day_offset in range(7):
+            # Calculate day_of_week based on query_start
+            current_date = query_start + timedelta(days=day_offset)
+            python_weekday = current_date.weekday()  # Monday=0, Sunday=6
+            day_of_week = (python_weekday + 1) % 7  # Convert to Sunday=0
+            
+            for hour in range(24):
+                for minute in [0, 30]:
+                    slot_id = day_offset * 10000 + hour * 100 + minute
+                    key = f"{day_offset}_{hour}_{minute}"
+                    is_available = override_lookup.get(key, False)
+                    
+                    time_slots.append({
+                        "id": slot_id,
+                        "date": current_date.isoformat(),
+                        "start_time": f"{hour:02d}:{minute:02d}",
+                        "end_time": f"{hour:02d}:{minute+30:02d}" if minute == 0 else f"{hour+1:02d}:00" if hour < 23 else "23:59",
+                        "day_of_week": day_of_week,
+                        "hour": hour,
+                        "minute": minute,
+                        "is_available": is_available,
+                        "is_override": True
+                    })
+        
+        # Use the appropriate date parameter for response
+        response_date = start_date if start_date else week_start_date
+        logger.info(f"Retrieved {len(override_slots)} actual override slots, generated {len(time_slots)} total slots for user {user_id}, date range: {response_date}")
         
         return {
             "user_id": user_id,
-            "week_start_date": week_start_date,
+            "week_start_date": response_date,
             "time_slots": time_slots
         }
     except HTTPException:
@@ -1095,6 +1143,7 @@ async def update_override_availability(
     try:
         user_id = request.get("user_id")
         week_start_date = request.get("week_start_date")
+        start_date = request.get("start_date")  # Support rolling start date
         time_slots = request.get("time_slots", [])
         
         # Check if user exists
@@ -1103,26 +1152,38 @@ async def update_override_availability(
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
         
-        # Parse week start date
+        # Determine the date range to use
         from datetime import datetime
-        week_start = datetime.strptime(week_start_date, "%Y-%m-%d").date()
+        if start_date:
+            # Rolling 7 days starting from the provided start_date
+            query_start = datetime.strptime(start_date, "%Y-%m-%d").date()
+            logger.info(f"Saving override with rolling start_date: {start_date}")
+        elif week_start_date:
+            # Traditional week start (backward compatibility)
+            query_start = datetime.strptime(week_start_date, "%Y-%m-%d").date()
+            logger.info(f"Saving override with week_start_date: {week_start_date}")
+        else:
+            raise HTTPException(status_code=400, detail="Either week_start_date or start_date parameter is required")
         
-        # Clear existing override availability for this user and week
+        # Clear existing override availability for this user and date range
         from app.models import UserAvailabilityOverride
         from sqlalchemy import delete
+        query_end = query_start + timedelta(days=7)
         await db.execute(
             delete(UserAvailabilityOverride).where(
                 UserAvailabilityOverride.user_id == user_id,
-                UserAvailabilityOverride.date >= week_start,
-                UserAvailabilityOverride.date < week_start + timedelta(days=7)
+                UserAvailabilityOverride.date >= query_start,
+                UserAvailabilityOverride.date < query_end
             )
         )
         
         # Handle When2Meet-style time slots (day_of_week, hour, minute format)
         # Convert to date-based format for storage
         override_slots = []
+        available_slot_count = 0
         for slot in time_slots:
             if slot.get("is_available", False):  # Only save available slots
+                available_slot_count += 1
                 day_of_week = slot.get("day_of_week")
                 hour = slot.get("hour")
                 minute = slot.get("minute")
@@ -1136,9 +1197,24 @@ async def update_override_availability(
                         logger.warning(f"Invalid minute {minute} for slot {slot}, skipping")
                         continue
                     
-                    # Calculate the actual date for this day of week in the target week
-                    days_to_add = (day_of_week - week_start.weekday()) % 7
-                    slot_date = week_start + timedelta(days=days_to_add)
+                    # For rolling dates, calculate the actual date based on day offset
+                    # day_of_week in this context is relative to the query_start date
+                    if start_date:
+                        # For rolling dates, use direct day mapping from the 7-day period
+                        # Find the day offset that matches the day_of_week
+                        for day_offset in range(7):
+                            check_date = query_start + timedelta(days=day_offset)
+                            check_weekday = (check_date.weekday() + 1) % 7  # Convert to Sunday=0
+                            if check_weekday == day_of_week:
+                                slot_date = check_date
+                                break
+                        else:
+                            logger.warning(f"Could not map day_of_week {day_of_week} for rolling date, skipping")
+                            continue
+                    else:
+                        # Traditional week calculation
+                        days_to_add = (day_of_week - query_start.weekday()) % 7
+                        slot_date = query_start + timedelta(days=days_to_add)
                     
                     # Create start and end times (30-minute slots)
                     start_time = time(hour, minute, 0)
@@ -1169,11 +1245,14 @@ async def update_override_availability(
             db.add(slot)
         
         await db.commit()
-        logger.info(f"Updated override availability for user {user_id} for week {week_start_date} with {len(override_slots)} time slots")
+        
+        # Use the appropriate date parameter for response
+        response_date = start_date if start_date else week_start_date
+        logger.info(f"Updated override availability for user {user_id} for date {response_date} with {len(override_slots)} time slots (from {available_slot_count} available slots)")
         
         return {
             "user_id": user_id,
-            "week_start_date": week_start_date,
+            "week_start_date": response_date,
             "time_slots": time_slots  # Return the original When2Meet format
         }
     except HTTPException:
