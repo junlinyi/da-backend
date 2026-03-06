@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -95,7 +95,7 @@ class FirebaseSyncService:
                             max_distance_km=user_data.get('maxDistanceKm', 32),
                             latitude=user_data.get('latitude'),
                             longitude=user_data.get('longitude'),
-                            location=user_data.get('location'),
+                            location=None if isinstance(user_data.get('location'), dict) else user_data.get('location'),
                             state=user_data.get('state'),
                             interests=user_data.get('interests', []),
                             bio=user_data.get('bio'),
@@ -117,7 +117,14 @@ class FirebaseSyncService:
                         existing_user.max_distance_km = user_data.get('maxDistanceKm', existing_user.max_distance_km)
                         existing_user.latitude = user_data.get('latitude', existing_user.latitude)
                         existing_user.longitude = user_data.get('longitude', existing_user.longitude)
-                        existing_user.location = user_data.get('location', existing_user.location)
+                        
+                        # Handle location field - Firebase may send dict or string
+                        location_data = user_data.get('location', existing_user.location)
+                        if isinstance(location_data, dict):
+                            # Skip updating location if it's a dict (incompatible with VARCHAR field)
+                            pass
+                        else:
+                            existing_user.location = location_data
                         existing_user.state = user_data.get('state', existing_user.state)
                         existing_user.interests = user_data.get('interests', existing_user.interests)
                         existing_user.bio = user_data.get('bio', existing_user.bio)
@@ -221,7 +228,7 @@ class FirebaseSyncService:
                             matched_user_id=max_id,
                             match_score=match_score,
                             status='pending',  # Default status
-                            created_at=match_data.get('createdAt', datetime.now())
+                            created_at=match_data.get('createdAt', datetime.now(timezone.utc))
                         )
                         db.add(match_record)
                         logger.info(f"Created match record for analytics: {user1.name} ↔ {user2.name} (score: {match_score:.2f})")

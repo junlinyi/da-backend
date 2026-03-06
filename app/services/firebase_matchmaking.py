@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Tuple, Dict, Any, Optional
 from geopy.distance import geodesic
 import firebase_admin
@@ -45,7 +45,7 @@ class FirebaseMatchmakingService:
             firebase_swipes = await self._get_firebase_swipes()
             
             # Get today's swipes from PostgreSQL (for consistency)
-            today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
             swipes_result = await db.execute(
                 select(Swipe)
                 .where(Swipe.swiper_id == current_user.id)

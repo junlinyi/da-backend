@@ -1,7 +1,7 @@
 from typing import Optional, List, Dict, Any, Tuple
 from app.models import User as DBUser
 from app.schemas import UserResponse, Location, TimeSlot, Gender
-from datetime import datetime
+from datetime import datetime, timezone
 import re
 import logging
 
@@ -584,7 +584,7 @@ def firestore_to_db_user_dynamic(firestore_data: Dict[str, Any]) -> dict:
     # Handle birthday to age conversion
     if 'birthday' in firestore_data and 'age' not in firestore_data:
         try:
-            from datetime import datetime
+            from datetime import datetime, timezone
             birthday = firestore_data['birthday']
             if hasattr(birthday, 'date'):  # Firestore timestamp
                 birthday_date = birthday.date()
@@ -593,12 +593,14 @@ def firestore_to_db_user_dynamic(firestore_data: Dict[str, Any]) -> dict:
             else:
                 birthday_date = birthday
             
-            age = datetime.now().year - birthday_date.year
-            if datetime.now().date() < birthday_date.replace(year=datetime.now().year):
+            now_utc = datetime.now(timezone.utc)
+            age = now_utc.year - birthday_date.year
+            if now_utc.date() < birthday_date.replace(year=now_utc.year):
                 age -= 1
             update_data['age'] = age
         except Exception as e:
-            print(f"Error calculating age from birthday: {e}")
+            # Error calculating age from birthday
+            pass
     
     return update_data
 

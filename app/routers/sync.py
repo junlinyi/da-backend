@@ -74,6 +74,7 @@ router = APIRouter()
 @router.post("/sync/user/{firebase_uid}")
 async def sync_user_from_firebase(
     firebase_uid: str,
+    decoded_token=Depends(verify_firebase_token),
     db: Session = Depends(get_db_sync)
 ):
     """
@@ -110,7 +111,7 @@ async def sync_user_from_firebase(
         raise HTTPException(status_code=500, detail=f"Sync failed: {str(e)}")
 
 @router.post("/sync/all")
-async def sync_all_users_from_firebase(db: Session = Depends(get_db_sync)):
+async def sync_all_users_from_firebase(decoded_token=Depends(verify_firebase_token), db: Session = Depends(get_db_sync)):
     """
     Sync all users from Firebase to PostgreSQL
     
@@ -140,6 +141,7 @@ async def sync_all_users_from_firebase(db: Session = Depends(get_db_sync)):
 @router.get("/sync/validate/{firebase_uid}")
 async def validate_user_consistency(
     firebase_uid: str,
+    decoded_token=Depends(verify_firebase_token),
     db: Session = Depends(get_db_sync)
 ):
     """
@@ -168,7 +170,7 @@ async def validate_user_consistency(
         raise HTTPException(status_code=500, detail=f"Validation failed: {str(e)}")
 
 @router.get("/sync/fields")
-async def get_sync_field_info(db: Session = Depends(get_db_sync)):
+async def get_sync_field_info(decoded_token=Depends(verify_firebase_token), db: Session = Depends(get_db_sync)):
     """
     Get information about fields that can be synced
     
@@ -233,7 +235,7 @@ async def sync_users(
                     max_distance_km=user_data.get('maxDistanceKm', 32),
                     latitude=user_data.get('latitude'),
                     longitude=user_data.get('longitude'),
-                    location=user_data.get('location'),
+                    location=None if isinstance(user_data.get('location'), dict) else user_data.get('location'),
                     state=user_data.get('state'),
                     interests=user_data.get('interests', []),
                     bio=user_data.get('bio'),
@@ -283,7 +285,7 @@ async def sync_all(
         raise HTTPException(status_code=500, detail=f"Failed to sync data: {str(e)}")
 
 @router.get("/status")
-async def sync_status():
+async def sync_status(decoded_token=Depends(verify_firebase_token)):
     """
     Get the status of the background sync service
     """

@@ -71,7 +71,7 @@ async def get_my_profile(decoded_token=Depends(verify_firebase_token), db: Async
     return user
 
 @router.get("/firebase/{firebase_uid}")
-async def get_user_by_firebase_uid(firebase_uid: str, db: AsyncSession = Depends(get_db)):
+async def get_user_by_firebase_uid(firebase_uid: str, decoded_token=Depends(verify_firebase_token), db: AsyncSession = Depends(get_db)):
     """
     Get user by Firebase UID (for iOS app to fetch user details)
     """
@@ -138,7 +138,7 @@ async def update_preferences(
     return user
 
 @router.get("/{user_id}", response_model=UserResponse)
-async def get_profile(user_id: int, db: AsyncSession = Depends(get_db)):
+async def get_profile(user_id: int, decoded_token=Depends(verify_firebase_token), db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalars().first()
     if not user:
@@ -146,11 +146,15 @@ async def get_profile(user_id: int, db: AsyncSession = Depends(get_db)):
     return user
 
 @router.put("/{user_id}", response_model=UserResponse)
-async def update_profile(user_id: int, profile: UserUpdate, db: AsyncSession = Depends(get_db)):
+async def update_user_by_id(user_id: int, profile: UserUpdate, decoded_token=Depends(verify_firebase_token), db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalars().first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+
+    # Only allow users to update their own record
+    if user.firebase_uid != decoded_token["uid"]:
+        raise HTTPException(status_code=403, detail="Not authorized to update this user")
 
     for key, value in profile.dict(exclude_unset=True).items():
         setattr(user, key, value)
@@ -159,11 +163,15 @@ async def update_profile(user_id: int, profile: UserUpdate, db: AsyncSession = D
     return user
 
 @router.delete("/{user_id}")
-async def delete_account(user_id: int, db: AsyncSession = Depends(get_db)):
+async def delete_account(user_id: int, decoded_token=Depends(verify_firebase_token), db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalars().first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+
+    # Only allow users to delete their own account
+    if user.firebase_uid != decoded_token["uid"]:
+        raise HTTPException(status_code=403, detail="Not authorized to delete this user")
 
     await db.delete(user)
     await db.commit()
@@ -172,9 +180,13 @@ async def delete_account(user_id: int, db: AsyncSession = Depends(get_db)):
 @router.post("/create", response_model=UserResponse)
 async def create_user(
     user: UserCreateRequest = Body(...),
+    decoded_token=Depends(verify_firebase_token),
     db: AsyncSession = Depends(get_db)
 ):
     logger.info(f"[USER CREATE] Attempting to create/update user: {user.firebase_uid} {user.email}")
+    # Only allow creating/updating own user record
+    if user.firebase_uid != decoded_token["uid"]:
+        raise HTTPException(status_code=403, detail="firebase_uid must match authenticated user")
     try:
         result = await db.execute(select(User).where(User.firebase_uid == user.firebase_uid))
         db_user = result.scalars().first()

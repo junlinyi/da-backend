@@ -7,9 +7,12 @@ from app.database import get_db
 from app.models import User, Swipe, Conversation
 from app.schemas import SwipeCreate, UserResponse
 from app.dependencies import verify_firebase_token
+import logging
+
+logger = logging.getLogger(__name__)
 from app.services.match_creation import create_match_in_firestore
 from typing import List
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
 
 logger = logging.getLogger(__name__)
@@ -19,11 +22,16 @@ router = APIRouter()
 @router.get("/potential-matches")
 async def get_potential_matches(
     user_id: str,
+    decoded_token=Depends(verify_firebase_token),
     db: AsyncSession = Depends(get_db)
 ):
     """
     Get potential matches for a user using real-time Firebase data (iOS app endpoint)
     """
+    # Enforce that callers can only query their own potential matches
+    if user_id != decoded_token["uid"]:
+        raise HTTPException(status_code=403, detail="Cannot fetch potential matches for another user")
+
     try:
         # Initialize Firebase matchmaking service
         firebase_service = FirebaseMatchmakingService()
@@ -53,7 +61,7 @@ async def _get_potential_matches_postgresql(user_id: str, db: AsyncSession):
         raise HTTPException(status_code=404, detail="User not found")
 
     # Get today's swipes
-    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     swipes_result = await db.execute(
         select(Swipe)
         .where(Swipe.swiper_id == current_user.id)
@@ -112,7 +120,7 @@ async def _get_potential_matches_postgresql(user_id: str, db: AsyncSession):
     }
 
 @router.get("/{user_id}/matches", response_model=List[UserResponse])
-async def get_matches(user_id: int, db: AsyncSession = Depends(get_db)):
+async def get_matches(user_id: int, decoded_token=Depends(verify_firebase_token), db: AsyncSession = Depends(get_db)):
     matches = await find_matches(user_id, db)
 
     # TODO: should we raise an exception if no matches?
@@ -127,31 +135,54 @@ async def swipe_user(
     decoded_token=Depends(verify_firebase_token),
     db: AsyncSession = Depends(get_db)
 ):
+    logger.info(f"🔥 [SWIPE_BACKEND] POST /swipe endpoint called")
+    logger.info(f"🔥 [SWIPE_BACKEND] Request data: swiped_firebase_uid={swipe.swiped_firebase_uid}, liked={swipe.liked}")
+    logger.info(f"🔥 [SWIPE_BACKEND] Firebase token decoded: uid={decoded_token.get('uid', 'MISSING')}")
+    
     swiper_firebase_uid = decoded_token["uid"]
+    logger.info(f"🔥 [SWIPE_BACKEND] Swiper Firebase UID: {swiper_firebase_uid}")
 
     # Get swiper User object
+    logger.info(f"🔍 [SWIPE_BACKEND] Looking up swiper user with Firebase UID: {swiper_firebase_uid}")
     result = await db.execute(select(User).where(User.firebase_uid == swiper_firebase_uid))
     swiper = result.scalar_one_or_none()
     if not swiper:
+        logger.error(f"❌ [SWIPE_BACKEND] Swiper user not found for Firebase UID: {swiper_firebase_uid}")
         raise HTTPException(status_code=404, detail="User not found")
+    
+    logger.info(f"✅ [SWIPE_BACKEND] Found swiper: id={swiper.id}, name={swiper.name}, email={swiper.email}")
 
     # Get swiped User object by Firebase UID
+    logger.info(f"🔍 [SWIPE_BACKEND] Looking up swiped user with Firebase UID: {swipe.swiped_firebase_uid}")
     result = await db.execute(select(User).where(User.firebase_uid == swipe.swiped_firebase_uid))
     swiped_user = result.scalar_one_or_none()
     if not swiped_user:
+        logger.error(f"❌ [SWIPE_BACKEND] Swiped user not found for Firebase UID: {swipe.swiped_firebase_uid}")
         raise HTTPException(status_code=404, detail="Swiped user not found")
+    
+    logger.info(f"✅ [SWIPE_BACKEND] Found swiped user: id={swiped_user.id}, name={swiped_user.name}, email={swiped_user.email}")
 
     # Prevent swiping on self
     if swiper.id == swiped_user.id:
+        logger.error(f"❌ [SWIPE_BACKEND] User trying to swipe on themselves: {swiper.id}")
         raise HTTPException(status_code=400, detail="Cannot swipe on yourself")
 
     # Save swipe
+    logger.info(f"📦 [SWIPE_BACKEND] Creating swipe record: swiper_id={swiper.id}, swiped_id={swiped_user.id}, liked={swipe.liked}")
     swipe_obj = Swipe(swiper_id=swiper.id, swiped_id=swiped_user.id, liked=swipe.liked)
     db.add(swipe_obj)
-    await db.commit()
+    
+    try:
+        await db.commit()
+        logger.info(f"✅ [SWIPE_BACKEND] Swipe record saved successfully to database")
+    except Exception as e:
+        logger.error(f"❌ [SWIPE_BACKEND] Failed to save swipe to database: {e}")
+        await db.rollback()
+        raise HTTPException(status_code=500, detail="Failed to save swipe")
 
     # If it's a like, check if the other user already liked them
     if swipe.liked:
+        logger.info(f"💖 [SWIPE_BACKEND] Checking for reciprocal like from user {swiped_user.id} to user {swiper.id}")
         result = await db.execute(
             select(Swipe)
             .where(Swipe.swiper_id == swiped_user.id)
@@ -161,15 +192,28 @@ async def swipe_user(
         reciprocal_swipe = result.scalar_one_or_none()
 
         if reciprocal_swipe:
+            logger.info(f"🎉 [SWIPE_BACKEND] MATCH FOUND! Creating match between {swiper.name} and {swiped_user.name}")
             # Create match in Firestore and conversation in PostgreSQL
-            await create_match_in_firestore(swiper.firebase_uid, swiped_user.firebase_uid, db)
+            try:
+                match_id = await create_match_in_firestore(swiper.firebase_uid, swiped_user.firebase_uid, db)
+                logger.info(f"✅ [SWIPE_BACKEND] Match created successfully with ID: {match_id}")
+            except Exception as e:
+                logger.error(f"❌ [SWIPE_BACKEND] Failed to create match in Firestore: {e}")
+                match_id = None
             
             # Extract first name from the matched user
             matched_first_name = swiped_user.name.split()[0] if swiped_user.name else "Someone"
+            logger.info(f"🎉 [SWIPE_BACKEND] Returning match response for: {matched_first_name}")
             
             return {
                 "message": "It's a match!",
-                "matchedUserName": matched_first_name
+                "matchedUserName": matched_first_name,
+                "matchId": match_id
             }
+        else:
+            logger.info(f"💖 [SWIPE_BACKEND] No reciprocal like found - no match yet")
+    else:
+        logger.info(f"🚫 [SWIPE_BACKEND] This was a dislike - no match check needed")
 
+    logger.info(f"✅ [SWIPE_BACKEND] Swipe processing completed successfully")
     return {"message": "Swipe recorded"}
