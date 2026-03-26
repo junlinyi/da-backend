@@ -129,6 +129,57 @@ async def get_matches(user_id: int, decoded_token=Depends(verify_firebase_token)
     return matches
 
 
+@router.get("/likes/received")
+async def get_received_likes(
+    decoded_token=Depends(verify_firebase_token),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Return all users who have liked (swiped right on) the authenticated user
+    and have not yet been responded to.
+    """
+    firebase_uid = decoded_token["uid"]
+
+    # Resolve authenticated user's integer ID
+    result = await db.execute(select(User).where(User.firebase_uid == firebase_uid))
+    current_user = result.scalar_one_or_none()
+    if not current_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Find all users who liked the current user but whom the current user has not yet swiped on
+    liked_me_result = await db.execute(
+        select(Swipe)
+        .where(Swipe.swiped_id == current_user.id)
+        .where(Swipe.liked == True)
+    )
+    liked_me_swipes = liked_me_result.scalars().all()
+
+    # Get the IDs the current user has already responded to
+    my_swipes_result = await db.execute(
+        select(Swipe.swiped_id).where(Swipe.swiper_id == current_user.id)
+    )
+    already_swiped_ids = {row for row in my_swipes_result.scalars().all()}
+
+    likes = []
+    for swipe in liked_me_swipes:
+        if swipe.swiper_id in already_swiped_ids:
+            continue  # Already responded
+
+        liker_result = await db.execute(select(User).where(User.id == swipe.swiper_id))
+        liker = liker_result.scalar_one_or_none()
+        if not liker:
+            continue
+
+        likes.append({
+            "id": liker.firebase_uid,
+            "name": liker.name or "Unknown",
+            "profileImageUrl": liker.profile_image_url,
+            "likedAt": swipe.timestamp.isoformat() if swipe.timestamp else None
+        })
+
+    return likes
+
+
 @router.post("/swipe")
 async def swipe_user(
     swipe: SwipeCreate,

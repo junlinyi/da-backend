@@ -1,7 +1,7 @@
 # app/models.py
 
 from datetime import datetime, time, date
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Boolean, Text, Float, func, ARRAY, UniqueConstraint, Time, Date, CheckConstraint
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Boolean, Text, Float, func, ARRAY, UniqueConstraint, Time, Date, CheckConstraint, JSON
 from sqlalchemy.orm import relationship
 from app.database import Base
 
@@ -37,6 +37,9 @@ class User(Base):
     # Profile Images
     profile_image_url = Column(String, nullable=True)
     additional_image_urls = Column(ARRAY(String), nullable=True)
+
+    # Profile Prompts — stored as [{question: str, answer: str}, ...]
+    prompts = Column(JSON, nullable=True)
     
     # Timezone
     timezone = Column(String, default='UTC')
@@ -224,6 +227,7 @@ class ScheduledCall(Base):
     user2 = relationship("User", foreign_keys=[user2_id], back_populates="scheduled_calls_as_user2")
     original_call = relationship("ScheduledCall", remote_side=[id], backref="rescheduled_calls")
     ratings = relationship("CallRating", back_populates="call", cascade="all, delete-orphan")
+    video_room = relationship("VideoCallRoom", back_populates="scheduled_call", uselist=False)
 
 
 class CallRating(Base):
@@ -353,4 +357,111 @@ class UserOverrideAvailability(Base):
         CheckConstraint('hour >= 0 AND hour <= 23', name='valid_hour'),
         CheckConstraint('minute IN (0, 30)', name='valid_minute'),
         UniqueConstraint('user_id', 'week_start_date', 'day_of_week', 'hour', 'minute', name='unique_user_week_time_slot'),
+    )
+
+
+# ============================================================================
+# Scheduling Proposal System Models
+# ============================================================================
+
+class SchedulingProposal(Base):
+    """Scheduling proposals from one user to another with multiple time slot options"""
+    __tablename__ = "scheduling_proposals"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    match_id = Column(Integer, ForeignKey("matches.id"), nullable=False)
+    proposer_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    receiver_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    
+    # Proposal status: pending, accepted, rejected, counter_proposed, expired
+    status = Column(String(20), nullable=False, default="pending")
+    message = Column(Text, nullable=True)  # Optional message from proposer
+    
+    # Timestamps
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    expires_at = Column(DateTime(timezone=True), nullable=False)  # Auto-expire after 24 hours
+    responded_at = Column(DateTime(timezone=True), nullable=True)
+    
+    # Relationships
+    match = relationship("Match", backref="scheduling_proposals")
+    proposer = relationship("User", foreign_keys=[proposer_id])
+    receiver = relationship("User", foreign_keys=[receiver_id])
+    time_slots = relationship("ProposalTimeSlot", back_populates="proposal", cascade="all, delete-orphan")
+    responses = relationship("ProposalResponse", back_populates="proposal", cascade="all, delete-orphan")
+
+
+class ProposalTimeSlot(Base):
+    """Time slots proposed within a scheduling proposal (2-3 options)"""
+    __tablename__ = "proposal_time_slots"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    proposal_id = Column(Integer, ForeignKey("scheduling_proposals.id", ondelete="CASCADE"), nullable=False)
+    
+    start_time = Column(DateTime(timezone=True), nullable=False)
+    end_time = Column(DateTime(timezone=True), nullable=False)
+    is_selected = Column(Boolean, nullable=False, default=False)  # Set to True when accepted
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    # Relationships
+    proposal = relationship("SchedulingProposal", back_populates="time_slots")
+
+
+class ProposalResponse(Base):
+    """Response to a scheduling proposal (accept/reject/counter)"""
+    __tablename__ = "proposal_responses"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    proposal_id = Column(Integer, ForeignKey("scheduling_proposals.id", ondelete="CASCADE"), nullable=False)
+    
+    # Response type: accept, reject, counter_propose
+    response_type = Column(String(20), nullable=False)
+    selected_slot_id = Column(Integer, ForeignKey("proposal_time_slots.id"), nullable=True)  # For accepts
+    counter_proposal_message = Column(Text, nullable=True)  # For counter proposals
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    # Relationships
+    proposal = relationship("SchedulingProposal", back_populates="responses")
+    selected_slot = relationship("ProposalTimeSlot")
+    counter_time_slots = relationship("CounterProposalTimeSlot", back_populates="response", cascade="all, delete-orphan")
+
+
+class CounterProposalTimeSlot(Base):
+    """Time slots for counter proposals"""
+    __tablename__ = "counter_proposal_time_slots"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    response_id = Column(Integer, ForeignKey("proposal_responses.id", ondelete="CASCADE"), nullable=False)
+    
+    start_time = Column(DateTime(timezone=True), nullable=False)
+    end_time = Column(DateTime(timezone=True), nullable=False)
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    # Relationships
+    response = relationship("ProposalResponse", back_populates="counter_time_slots")
+
+
+# ============================================================================
+# Video Call Room Models
+# ============================================================================
+
+class VideoCallRoom(Base):
+    """Video call rooms for scheduled calls using Twilio"""
+    __tablename__ = "video_call_rooms"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    scheduled_call_id = Column(Integer, ForeignKey("scheduled_calls.id"), nullable=False)
+    room_name = Column(String(255), unique=True, nullable=False, index=True)
+    room_sid = Column(String(255), nullable=True)  # Twilio room SID
+    status = Column(String(50), nullable=False, server_default='active')  # 'active', 'ended', 'expired'
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    ended_at = Column(DateTime(timezone=True), nullable=True)
+    
+    # Relationships
+    scheduled_call = relationship("ScheduledCall", back_populates="video_room")
+    
+    __table_args__ = (
+        CheckConstraint("status IN ('active', 'ended', 'expired')", name='valid_status'),
     )

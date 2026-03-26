@@ -52,6 +52,7 @@ class UserResponse(BaseModel):
     profile_completed: Optional[bool] = None
     is_verified: Optional[bool] = None
     strikes: Optional[int] = None
+    prompts: Optional[List[dict]] = None
 
 # Profile update schema - used by iOS app for /me/profile endpoint
 class ProfileUpdate(BaseModel):
@@ -62,6 +63,7 @@ class ProfileUpdate(BaseModel):
     interests: Optional[List[str]] = None
     location: Optional[Location] = None
     profileImageURL: Optional[str] = None
+    prompts: Optional[List[dict]] = None
 
 # Preferences update schema - used by iOS app for /me/preferences endpoint
 class PreferencesUpdate(BaseModel):
