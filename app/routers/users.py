@@ -3,8 +3,9 @@
 from fastapi import APIRouter, Depends, HTTPException, Body
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
+from sqlalchemy import or_, and_
 from app.database import DATABASE_URL, get_db
-from app.models import User
+from app.models import User, Match, Conversation
 from app.schemas import UserResponse, UserUpdate, ProfileUpdate, PreferencesUpdate
 from app.dependencies import verify_firebase_token
 from pydantic import BaseModel
@@ -176,6 +177,69 @@ async def delete_account(user_id: int, decoded_token=Depends(verify_firebase_tok
     await db.delete(user)
     await db.commit()
     return {"message": "User deleted successfully"}
+
+@router.post("/me/block/{blocked_firebase_uid}")
+async def block_user(
+    blocked_firebase_uid: str,
+    decoded_token=Depends(verify_firebase_token),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Block a user by their Firebase UID. This marks the match as blocked
+    and deactivates the conversation between the two users.
+    """
+    current_firebase_uid = decoded_token["uid"]
+
+    if current_firebase_uid == blocked_firebase_uid:
+        raise HTTPException(status_code=400, detail="Cannot block yourself")
+
+    # Resolve both users
+    current_result = await db.execute(select(User).where(User.firebase_uid == current_firebase_uid))
+    current_user = current_result.scalars().first()
+    if not current_user:
+        raise HTTPException(status_code=404, detail="Current user not found")
+
+    blocked_result = await db.execute(select(User).where(User.firebase_uid == blocked_firebase_uid))
+    blocked_user = blocked_result.scalars().first()
+    if not blocked_user:
+        raise HTTPException(status_code=404, detail="Blocked user not found")
+
+    # Find the match (either direction)
+    match_result = await db.execute(
+        select(Match).where(
+            or_(
+                and_(Match.user_id == current_user.id, Match.matched_user_id == blocked_user.id),
+                and_(Match.user_id == blocked_user.id, Match.matched_user_id == current_user.id)
+            )
+        )
+    )
+    match = match_result.scalars().first()
+
+    if match:
+        # Mark the blocker's side as blocked
+        if match.user_id == current_user.id:
+            match.user1_status = "blocked"
+        else:
+            match.user2_status = "blocked"
+        match.status = "blocked"
+
+    # Deactivate the conversation
+    conv_result = await db.execute(
+        select(Conversation).where(
+            or_(
+                and_(Conversation.user1_id == current_user.id, Conversation.user2_id == blocked_user.id),
+                and_(Conversation.user1_id == blocked_user.id, Conversation.user2_id == current_user.id)
+            )
+        )
+    )
+    conversation = conv_result.scalars().first()
+    if conversation:
+        conversation.is_active = False
+
+    await db.commit()
+    logger.info(f"User {current_user.id} blocked user {blocked_user.id}")
+    return {"message": "User blocked successfully"}
+
 
 @router.post("/create", response_model=UserResponse)
 async def create_user(
