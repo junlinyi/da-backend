@@ -2,7 +2,7 @@
 
 import logging
 from typing import Dict, Any, List, Tuple, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from app.utils import (
     validate_user_data_comprehensive,
     validate_email_format,
@@ -220,11 +220,11 @@ class ValidationService:
             errors.append("Last active must be a datetime object")
         else:
             # Check if last active is not in the future
-            if last_active > datetime.utcnow():
+            if last_active > datetime.now(timezone.utc):
                 errors.append("Last active cannot be in the future")
-            
+
             # Check if last active is not too far in the past (e.g., more than 1 year)
-            one_year_ago = datetime.utcnow() - timedelta(days=365)
+            one_year_ago = datetime.now(timezone.utc) - timedelta(days=365)
             if last_active < one_year_ago:
                 errors.append("Last active seems too far in the past")
         

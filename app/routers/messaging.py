@@ -6,7 +6,7 @@ from app.models import User, Message, Conversation
 from app.schemas import MessageCreate, MessageResponse, ConversationResponse
 from app.dependencies import verify_firebase_token
 from typing import List
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import firebase_admin
 from firebase_admin import firestore
@@ -73,7 +73,7 @@ async def get_conversations(
                             other_user_name=other_user.name or "Unknown User",
                             other_user_profile_image=other_user.profile_image_url,
                             last_message=data.get('lastMessage', ''),
-                            last_message_at=data.get('lastMessageTime', datetime.utcnow()),
+                            last_message_at=data.get('lastMessageTime', datetime.now(timezone.utc)),
                             unread_count=data.get('unreadCounts', {}).get(current_user_firebase_uid, 0)
                         )
                         conversations.append(conversation_response)
@@ -133,7 +133,7 @@ async def get_messages(
                 id=doc.id,
                 sender_id=data.get('senderId', ''),
                 content=data.get('content', ''),
-                timestamp=data.get('timestamp', datetime.utcnow()),
+                timestamp=data.get('timestamp', datetime.now(timezone.utc)),
                 message_type=data.get('messageType', 'text')
             )
             messages.append(message_response)
@@ -212,7 +212,7 @@ async def send_message(
             "success": True,
             "message_id": message_ref[1].id,
             "content": message.content,
-            "timestamp": datetime.utcnow()
+            "timestamp": datetime.now(timezone.utc)
         }
         
     except Exception as e:
@@ -232,7 +232,8 @@ async def mark_messages_as_read_firebase(conversation_id: str, user_firebase_uid
         })
         
     except Exception as e:
-        print(f"Error marking messages as read: {e}")
+        # Error marking messages as read
+        pass
 
 async def create_message_in_postgresql(
     conversation_id: str, 
@@ -258,15 +259,16 @@ async def create_message_in_postgresql(
                 sender_id=sender_id,
                 content=content,
                 message_type=message_type,
-                timestamp=datetime.utcnow(),
+                timestamp=datetime.now(timezone.utc),
                 firebase_id=conversation_id  # Store Firebase conversation ID for reference
             )
             db.add(new_message)
             await db.commit()
             
     except Exception as e:
-        print(f"Error creating message in PostgreSQL: {e}")
+        # Error creating message in PostgreSQL
         # Don't fail the main operation if PostgreSQL sync fails
+        pass
 
 async def mark_messages_as_read(conversation_id: int, user_id: int, db: AsyncSession):
     """

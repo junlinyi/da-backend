@@ -5,12 +5,13 @@ Checks for common availability between matched users and sends notifications
 
 import asyncio
 import logging
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from typing import List, Optional, Tuple
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
 from sqlalchemy import and_, or_
+import pytz
 
 from app.database import SessionLocal
 from app.models import (
@@ -21,6 +22,10 @@ from app.models import (
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+def utc_now() -> datetime:
+    """Get current UTC time as timezone-aware datetime object"""
+    return datetime.now(timezone.utc)
 
 async def get_db_session():
     """Get a database session for background services"""
@@ -81,7 +86,6 @@ class SchedulingMonitorService:
                 result = await db.execute(
                     select(UserMatchCallPreferences)
                     .where(UserMatchCallPreferences.status == 'pending')
-                    .options(selectinload(UserMatchCallPreferences.user))
                 )
                 pending_preferences = result.scalars().all()
                 
@@ -138,7 +142,7 @@ class SchedulingMonitorService:
             
             # Check if we should skip this check (cooldown period)
             if preference.last_common_availability_check:
-                time_since_last_check = datetime.utcnow() - preference.last_common_availability_check
+                time_since_last_check = utc_now() - preference.last_common_availability_check
                 if time_since_last_check.total_seconds() < self.check_interval:
                     return
             
@@ -151,20 +155,20 @@ class SchedulingMonitorService:
             )
             
             # Update last check time
-            preference.last_common_availability_check = datetime.utcnow()
+            preference.last_common_availability_check = utc_now()
             await db.commit()
             
             if common_slots:
                 # Check if we should send notification (cooldown)
                 should_send = True
                 if preference.last_notification_sent:
-                    time_since_notification = datetime.utcnow() - preference.last_notification_sent
+                    time_since_notification = utc_now() - preference.last_notification_sent
                     if time_since_notification.total_seconds() < self.notification_cooldown:
                         should_send = False
                 
                 if should_send:
                     await self.send_availability_notification(db, user1, user2, common_slots)
-                    preference.last_notification_sent = datetime.utcnow()
+                    preference.last_notification_sent = utc_now()
                     await db.commit()
                     
                     logger.info(f"Sent availability notification to users {user1.id} and {user2.id}")
@@ -191,12 +195,12 @@ class SchedulingMonitorService:
             
             # Convert to response format and filter out past times
             available_slots = []
-            now = datetime.utcnow()
+            now = utc_now()
             
             for slot in common_slots:
-                # Convert date and time to UTC datetime
-                slot_start_utc = datetime.combine(slot.date, slot.start_time)
-                slot_end_utc = datetime.combine(slot.date, slot.end_time)
+                # Convert date and time to UTC datetime (timezone-aware)
+                slot_start_utc = datetime.combine(slot.date, slot.start_time, timezone.utc)
+                slot_end_utc = datetime.combine(slot.date, slot.end_time, timezone.utc)
                 
                 # Only include future slots
                 if slot_start_utc > now:
@@ -280,7 +284,7 @@ class SchedulingMonitorService:
                 
                 if preference:
                     preference.status = status
-                    preference.updated_at = datetime.utcnow()
+                    preference.updated_at = utc_now()
                 else:
                     # Create new preference
                     preference = UserMatchCallPreferences(
@@ -308,7 +312,6 @@ class SchedulingMonitorService:
                         UserMatchCallPreferences.user_id == user_id,
                         UserMatchCallPreferences.status == 'wants_to_call'
                     )
-                    .options(selectinload(UserMatchCallPreferences.user))
                 )
                 preferences = result.scalars().all()
                 

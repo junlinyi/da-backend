@@ -82,25 +82,85 @@ CREATE TRIGGER trigger_update_call_preferences
     FOR EACH ROW
     EXECUTE FUNCTION update_call_preferences_on_schedule();
 
--- 8. Add function to check for scheduling conflicts
+-- 8. Helper function to get week start as Sunday (matching how overrides are stored)
+-- IMPORTANT: date_trunc('week') returns Monday, but overrides use Sunday!
+CREATE OR REPLACE FUNCTION get_week_start_sunday(p_date DATE)
+RETURNS DATE AS $$
+BEGIN
+    RETURN p_date - EXTRACT(dow FROM p_date)::integer;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
+-- 8b. Add function to check for scheduling conflicts (uses override-first availability logic)
 CREATE OR REPLACE FUNCTION check_scheduling_conflict(
     p_user_id INTEGER,
     p_start_time TIMESTAMP WITH TIME ZONE,
     p_end_time TIMESTAMP WITH TIME ZONE
 ) RETURNS BOOLEAN AS $$
 DECLARE
-    conflict_exists BOOLEAN;
+    call_conflict_exists BOOLEAN;
+    user_is_available BOOLEAN;
+    check_date DATE;
+    check_day_of_week INTEGER;
+    check_hour INTEGER;
+    check_minute INTEGER;
+    week_start DATE;
+    utc_start_time TIMESTAMP;
 BEGIN
+    -- 1. Check for conflicts with existing scheduled calls
     SELECT EXISTS(
-        SELECT 1 FROM scheduled_calls 
+        SELECT 1 FROM scheduled_calls
         WHERE (user1_id = p_user_id OR user2_id = p_user_id)
           AND status IN ('scheduled', 'in_progress')
-          AND (
-              (scheduled_start_utc < p_end_time AND scheduled_end_utc > p_start_time)
-          )
-    ) INTO conflict_exists;
-    
-    RETURN conflict_exists;
+          AND (scheduled_start_utc < p_end_time AND scheduled_end_utc > p_start_time)
+    ) INTO call_conflict_exists;
+
+    -- If there's already a call conflict, return true immediately
+    IF call_conflict_exists THEN
+        RETURN TRUE;
+    END IF;
+
+    -- 2. Check user availability using EXACT same logic as find_common_availability
+    -- Convert to UTC timestamp for consistent extraction
+    utc_start_time := p_start_time AT TIME ZONE 'UTC';
+
+    -- Extract date components (in UTC)
+    check_date := utc_start_time::date;
+    check_day_of_week := EXTRACT(dow FROM utc_start_time)::integer;  -- 0=Sunday, 6=Saturday
+    check_hour := EXTRACT(hour FROM utc_start_time)::integer;
+
+    -- Round minute to 30-minute slot (0 or 30) to match availability table structure
+    check_minute := CASE
+        WHEN EXTRACT(minute FROM utc_start_time)::integer < 30 THEN 0
+        ELSE 30
+    END;
+
+    -- Calculate week start as SUNDAY (matching how overrides are stored)
+    -- NOT using date_trunc('week') which returns Monday!
+    week_start := get_week_start_sunday(check_date);
+
+    -- Use IDENTICAL logic to find_common_availability:
+    -- LEFT JOIN override onto default, COALESCE to get effective availability
+    SELECT COALESCE(o.is_available, d.is_available, FALSE) INTO user_is_available
+    FROM user_default_availability d
+    LEFT JOIN user_override_availability o ON
+        d.user_id = o.user_id
+        AND d.day_of_week = o.day_of_week
+        AND d.hour = o.hour
+        AND d.minute = o.minute
+        AND o.week_start_date = week_start
+    WHERE d.user_id = p_user_id
+      AND d.day_of_week = check_day_of_week
+      AND d.hour = check_hour
+      AND d.minute = check_minute;
+
+    -- If no availability record found at all, assume not available
+    IF user_is_available IS NULL THEN
+        user_is_available := FALSE;
+    END IF;
+
+    -- Return TRUE if there's a conflict (user is NOT available)
+    RETURN NOT user_is_available;
 END;
 $$ LANGUAGE plpgsql;
 

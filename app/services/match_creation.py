@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from app.models import User, Conversation
+from app.models import User, Conversation, Match
 
 async def create_match_in_firestore(
     user1_uid: str, 
@@ -41,7 +41,7 @@ async def create_match_in_firestore(
         match_data = match_doc.to_dict()
         users = match_data.get("users", [])
         if len(users) == 2 and user2_uid in users:
-            print(f"Match already exists in Firestore: {match_doc.id}")
+            # Match already exists in Firestore
             # Create conversation in PostgreSQL if it doesn't exist
             await create_conversation_in_postgres(user1_uid, user2_uid, db)
             return match_doc.id
@@ -69,16 +69,17 @@ async def create_match_in_firestore(
     }
     
     match_ref.set(match_data)
-    print(f"Match created in Firestore: {match_ref.id}")
+    # Match created in Firestore
     
-    # Create conversation in PostgreSQL
-    await create_conversation_in_postgres(user1_uid, user2_uid, db)
+    # Create conversation and match in PostgreSQL, return the PostgreSQL match ID
+    match_id = await create_conversation_and_match_in_postgres(user1_uid, user2_uid, db)
     
-    return match_ref.id
+    return match_id
 
-async def create_conversation_in_postgres(user1_uid: str, user2_uid: str, db: AsyncSession):
+async def create_conversation_and_match_in_postgres(user1_uid: str, user2_uid: str, db: AsyncSession):
     """
-    Create a conversation in PostgreSQL for the matched users.
+    Create a conversation and match record in PostgreSQL for the matched users.
+    Returns the PostgreSQL match ID.
     """
     # Get user IDs from Firebase UIDs
     result = await db.execute(select(User).where(User.firebase_uid == user1_uid))
@@ -88,7 +89,7 @@ async def create_conversation_in_postgres(user1_uid: str, user2_uid: str, db: As
     user2 = result.scalar_one_or_none()
     
     if not user1 or not user2:
-        print(f"Could not find users for UIDs: {user1_uid}, {user2_uid}")
+        # Could not find users
         return
     
     # Check if conversation already exists (in either direction)
@@ -101,21 +102,47 @@ async def create_conversation_in_postgres(user1_uid: str, user2_uid: str, db: As
     existing = existing_conversation.scalar_one_or_none()
     
     if existing:
-        print(f"Conversation already exists in PostgreSQL: {existing.id}")
-        return existing
+        # Conversation already exists in PostgreSQL
+        # Still need to check/create the match record
+        pass
+    else:
+        # Create conversation
+        conversation = Conversation(
+            user1_id=user1.id,
+            user2_id=user2.id
+        )
+        
+        db.add(conversation)
+        await db.commit()
+        await db.refresh(conversation)
+        # Conversation created in PostgreSQL
     
-    # Create conversation
-    conversation = Conversation(
-        user1_id=user1.id,
-        user2_id=user2.id
+    # Check if match already exists (in either direction)
+    existing_match = await db.execute(
+        select(Match).where(
+            ((Match.user_id == user1.id) & (Match.matched_user_id == user2.id)) |
+            ((Match.user_id == user2.id) & (Match.matched_user_id == user1.id))
+        )
+    )
+    match_record = existing_match.scalar_one_or_none()
+    
+    if match_record:
+        # Match already exists in PostgreSQL
+        return match_record.id
+    
+    # Create match record
+    match_record = Match(
+        user_id=user1.id,
+        matched_user_id=user2.id,
+        status="active"
     )
     
-    db.add(conversation)
+    db.add(match_record)
     await db.commit()
-    await db.refresh(conversation)
+    await db.refresh(match_record)
     
-    print(f"Conversation created in PostgreSQL: {conversation.id}")
-    return conversation
+    # Match created in PostgreSQL
+    return match_record.id
 
 def update_match_status(match_id: str, status: str) -> bool:
     """
@@ -138,7 +165,7 @@ def update_match_status(match_id: str, status: str) -> bool:
         })
         return True
     except Exception as e:
-        print(f"Error updating match status: {e}")
+        # Error updating match status
         return False
 
 def update_user_activity(match_id: str, user_uid: str) -> bool:
@@ -165,5 +192,5 @@ def update_user_activity(match_id: str, user_uid: str) -> bool:
         })
         return True
     except Exception as e:
-        print(f"Error updating user activity: {e}")
+        # Error updating user activity
         return False

@@ -162,23 +162,23 @@ class DataSyncService:
         # Use dynamic field mapping
         update_data = firestore_to_db_user_dynamic(firestore_data)
         
-        print(f"DEBUG: Update data for user {db_user.firebase_uid}: {update_data}")
+        # Debug: update data for user
         
         # Apply updates to database user
         for db_field, value in update_data.items():
-            print(f"DEBUG: Processing field {db_field} = {value}")
+            # Debug: processing field
             if hasattr(db_user, db_field):
                 # Validate field compatibility
                 field_valid, field_error = validate_field_compatibility(db_field, value)
                 if field_valid:
                     setattr(db_user, db_field, value)
-                    print(f"DEBUG: Successfully set {db_field} = {value}")
+                    # Debug: successfully set field
                 else:
                     logger.warning(f"Field validation failed for {db_field}: {field_error}")
-                    print(f"DEBUG: Field validation failed for {db_field}: {field_error}")
+                    # Debug: field validation failed
             else:
                 logger.warning(f"Database field '{db_field}' not found in User model")
-                print(f"DEBUG: Database field '{db_field}' not found in User model")
+                # Debug: database field not found
     
     def _update_db_user_from_firestore(self, db_user: DBUser, firestore_data: Dict[str, Any]):
         """Legacy method - kept for backward compatibility"""
