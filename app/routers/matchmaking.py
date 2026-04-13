@@ -6,7 +6,7 @@ from app.services.firebase_matchmaking import FirebaseMatchmakingService
 from app.database import get_db
 from app.models import User, Swipe, Conversation
 from app.schemas import SwipeCreate, UserResponse
-from app.dependencies import verify_firebase_token
+from app.dependencies import verify_firebase_token, get_current_user
 import logging
 
 logger = logging.getLogger(__name__)
@@ -120,10 +120,15 @@ async def _get_potential_matches_postgresql(user_id: str, db: AsyncSession):
     }
 
 @router.get("/{user_id}/matches", response_model=List[UserResponse])
-async def get_matches(user_id: int, decoded_token=Depends(verify_firebase_token), db: AsyncSession = Depends(get_db)):
-    matches = await find_matches(user_id, db)
+async def get_matches(
+    user_id: int,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    if current_user.id != user_id:
+        raise HTTPException(status_code=403, detail="Cannot fetch matches for another user")
 
-    # TODO: should we raise an exception if no matches?
+    matches = await find_matches(user_id, db)
     if not matches:
         raise HTTPException(status_code=404, detail="No matches found")
     return matches
