@@ -123,8 +123,7 @@ class FirebaseMatchmakingService:
                 "remainingSwipes": remaining_swipes
             }
             
-        except Exception as e:
-            logger.error(f"Error in get_potential_matches_realtime: {e}")
+        except Exception:
             raise
     
     async def _get_firebase_users(self) -> List[Dict[str, Any]]:
@@ -191,9 +190,12 @@ class FirebaseMatchmakingService:
         if current_user.preferred_gender not in [potential_match.gender, "any"]:
             return False
         
-        # Age preference
-        if not (current_user.min_age_preference <= potential_match.age <= current_user.max_age_preference):
-            return False
+        # Age preference — skip check if either bound or the match's age is unset
+        if current_user.min_age_preference is not None and current_user.max_age_preference is not None:
+            if potential_match.age is None:
+                return False
+            if not (current_user.min_age_preference <= potential_match.age <= current_user.max_age_preference):
+                return False
         
         # Must have complete profile
         if not all([potential_match.name, potential_match.age, potential_match.gender,

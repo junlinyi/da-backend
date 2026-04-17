@@ -15,9 +15,10 @@ import pytz
 
 from app.database import SessionLocal
 from app.models import (
-    User, Match, UserMatchCallPreferences, UserWeeklyAvailability, 
-    UserAvailabilityOverride, ScheduledCall, UserTimezone
+    User, Match, UserMatchCallPreferences, UserWeeklyAvailability,
+    UserAvailabilityOverride, ScheduledCall, UserTimezone, BehavioralEvent
 )
+from app.services import push_notification_service as push
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -31,13 +32,6 @@ async def get_db_session():
     """Get a database session for background services"""
     async with SessionLocal() as session:
         yield session
-
-# Placeholder function for push notifications (to be implemented later)
-async def send_push_notification(firebase_uid: str, title: str, message: str, data: dict = None):
-    """Placeholder function for sending push notifications"""
-    logger.info(f"Would send push notification to {firebase_uid}: {title} - {message}")
-    # TODO: Implement actual push notification logic
-    pass
 
 class SchedulingMonitorService:
     """
@@ -60,63 +54,243 @@ class SchedulingMonitorService:
         if self.is_running:
             logger.warning("Scheduling monitor is already running")
             return
-        
+
         self.is_running = True
         logger.info("Starting scheduling monitor service")
-        
-        try:
-            while self.is_running:
+
+        while self.is_running:
+            try:
                 await self.check_all_matches()
-                await asyncio.sleep(self.check_interval)
-        except Exception as e:
-            logger.error(f"Error in scheduling monitor: {e}")
-            self.is_running = False
-            raise
+            except asyncio.CancelledError:
+                logger.info("Scheduling monitor received CancelledError — shutting down")
+                break
+            except Exception as e:
+                logger.error(
+                    f"[MONITOR] Uncaught error in check_all_matches — will retry in {self.check_interval}s: {e}",
+                    exc_info=True,
+                )
+            await asyncio.sleep(self.check_interval)
     
     async def stop_monitoring(self):
         """Stop the continuous monitoring service"""
         self.is_running = False
         logger.info("Stopping scheduling monitor service")
     
+    async def expire_stale_matches(self, db: AsyncSession) -> int:
+        """Mark active matches as expired if past the 48-hour scheduling window with no call.
+
+        Returns the number of matches expired.
+        """
+        from app.models import MatchOutcome
+        now = utc_now()
+        cutoff = now - timedelta(hours=48)
+
+        # Find active matches older than 48 hours
+        stale_q = await db.execute(
+            select(Match).where(
+                Match.status.in_(["active", "accepted", "pending"]),
+                Match.created_at < cutoff,
+            )
+        )
+        stale_matches = stale_q.scalars().all()
+
+        expired_count = 0
+        for match in stale_matches:
+            # Skip if a completed/scheduled call exists for this match
+            call_q = await db.execute(
+                select(ScheduledCall).where(
+                    ScheduledCall.match_id == match.id,
+                    ScheduledCall.status.in_(["scheduled", "in_progress", "completed"]),
+                ).limit(1)
+            )
+            if call_q.scalars().first():
+                continue
+
+            match.status = "expired"
+            expired_count += 1
+
+        if expired_count:
+            await db.commit()
+            logger.info(f"[EXPIRY] Expired {expired_count} stale matches past 48-hour window")
+
+        return expired_count
+
+    async def notify_expiring_matches(self, db: AsyncSession) -> int:
+        """S7 — Notify both users when a match's 48h window has ≤6 hours left.
+
+        Uses the last_notification_sent cooldown to avoid re-sending within an hour.
+        Returns the number of notifications sent.
+        """
+        now = utc_now()
+        warning_cutoff = now - timedelta(hours=42)   # 42h elapsed → 6h remaining
+        expiry_cutoff = now - timedelta(hours=48)    # already expired
+
+        # Matches in the warning window: created between 42h and 48h ago
+        expiring_q = await db.execute(
+            select(Match).where(
+                Match.status.in_(["active", "accepted", "pending"]),
+                Match.created_at < warning_cutoff,
+                Match.created_at >= expiry_cutoff,
+            )
+        )
+        expiring_matches = expiring_q.scalars().all()
+
+        sent = 0
+        for match in expiring_matches:
+            # Skip if a call is already scheduled
+            call_q = await db.execute(
+                select(ScheduledCall).where(
+                    ScheduledCall.match_id == match.id,
+                    ScheduledCall.status.in_(["scheduled", "in_progress", "completed"]),
+                ).limit(1)
+            )
+            if call_q.scalars().first():
+                continue
+
+            # Load both users
+            u1_q = await db.execute(select(User).where(User.id == match.user_id))
+            u1 = u1_q.scalar_one_or_none()
+            u2_q = await db.execute(select(User).where(User.id == match.matched_user_id))
+            u2 = u2_q.scalar_one_or_none()
+            if not u1 or not u2:
+                continue
+
+            hours_left = max(0, int((match.created_at + timedelta(hours=48) - now).total_seconds() // 3600))
+
+            for user in (u1, u2):
+                try:
+                    other = u2 if user.id == u1.id else u1
+                    await push.notify_match_expiring(
+                        user=user,
+                        match_name=other.name or "your match",
+                        hours_left=hours_left,
+                    )
+                    sent += 1
+                except Exception as exc:
+                    logger.warning(f"[PUSH] S7 notification failed for user {user.id}: {exc}")
+
+        if sent:
+            logger.info(f"[EXPIRY_WARN] Sent {sent} match-expiry warning notifications")
+        return sent
+
+    async def detect_no_shows(self, db: AsyncSession) -> int:
+        """Mark scheduled calls as no_show when start_time + 20 min has passed and nobody joined.
+
+        Increments no_show_count on absent users and notifies the waiting partner.
+        Returns the number of calls marked as no_show.
+        """
+        now = utc_now()
+        no_show_cutoff = now - timedelta(minutes=20)
+
+        # Calls that started more than 20 minutes ago and are still in 'scheduled' state
+        stale_q = await db.execute(
+            select(ScheduledCall).where(
+                ScheduledCall.status == "scheduled",
+                ScheduledCall.scheduled_start_utc < no_show_cutoff,
+            )
+        )
+        stale_calls = stale_q.scalars().all()
+
+        count = 0
+        for call in stale_calls:
+            call.status = "no_show"
+            call.cancellation_reason = "no_show"
+            call.call_ended_at = now
+
+            # Load both participants
+            u1_q = await db.execute(select(User).where(User.id == call.user1_id))
+            u1 = u1_q.scalar_one_or_none()
+            u2_q = await db.execute(select(User).where(User.id == call.user2_id))
+            u2 = u2_q.scalar_one_or_none()
+
+            joined_ids: set[int] = set()
+            if call.call_started_at:
+                # If the call started at all, at least one user joined — treat both as present.
+                # Granular per-participant tracking requires Twilio webhook data; skip for now.
+                joined_ids = {call.user1_id, call.user2_id}
+
+            for user in (u for u in [u1, u2] if u is not None):
+                if user.id not in joined_ids:
+                    # Increment no_show counter on absent user
+                    user.no_show_count = (user.no_show_count or 0) + 1
+                    user.last_no_show_at = now
+
+                    # Log a behavioral event for the ML system
+                    db.add(BehavioralEvent(
+                        user_id=user.id,
+                        event_type="call_no_show",
+                        event_meta={"call_id": call.id, "match_id": call.match_id},
+                    ))
+
+            # Notify the waiting user (the one who joined when the other didn't)
+            if u1 and u2 and not joined_ids:
+                # Neither joined — notify both that the call didn't happen
+                for waiting, absent in [(u1, u2), (u2, u1)]:
+                    try:
+                        await push.notify_no_show_partner(
+                            waiting_user=waiting,
+                            absent_name=absent.name or "Your match",
+                            call_id=call.id,
+                        )
+                    except Exception as exc:
+                        logger.warning(f"[NO_SHOW] Push failed for user {waiting.id}: {exc}")
+
+            count += 1
+
+        if count:
+            await db.commit()
+            logger.info(f"[NO_SHOW] Marked {count} call(s) as no_show")
+
+        return count
+
     async def check_all_matches(self):
-        """Check all pending matches for common availability"""
+        """Check all pending matches for common availability and expire stale ones."""
         async for db in get_db_session():
             try:
+                # Expire matches that have passed the 48h scheduling window
+                await self.expire_stale_matches(db)
+
+                # Mark calls that were never joined as no_show
+                await self.detect_no_shows(db)
+
+                # S7 — warn users whose match window is almost closed
+                await self.notify_expiring_matches(db)
+
                 # Get all pending call preferences
                 result = await db.execute(
                     select(UserMatchCallPreferences)
                     .where(UserMatchCallPreferences.status == 'pending')
                 )
                 pending_preferences = result.scalars().all()
-                
+
                 logger.info(f"Checking {len(pending_preferences)} pending call preferences")
-                
+
                 for preference in pending_preferences:
                     # Additional safety check: ensure no scheduled calls exist
                     scheduled_call_result = await db.execute(
                         select(ScheduledCall).where(
                             and_(
                                 or_(
-                                    and_(ScheduledCall.user1_id == preference.user_id, 
+                                    and_(ScheduledCall.user1_id == preference.user_id,
                                          ScheduledCall.user2_id == preference.matched_user_id),
-                                    and_(ScheduledCall.user1_id == preference.matched_user_id, 
+                                    and_(ScheduledCall.user1_id == preference.matched_user_id,
                                          ScheduledCall.user2_id == preference.user_id)
                                 ),
                                 ScheduledCall.status.in_(['scheduled', 'in_progress'])
                             )
-                        )
+                        ).limit(1)
                     )
-                    existing_call = scheduled_call_result.scalar_one_or_none()
-                    
+                    existing_call = scheduled_call_result.scalars().first()
+
                     if existing_call:
                         logger.info(f"Skipping preference {preference.id}: call already scheduled for {existing_call.id}")
                         # Update status to prevent future checks
                         preference.status = 'wants_to_call'
                         await db.commit()
                         continue
-                    
+
                     await self.check_match_availability(db, preference)
-                    
+
             except Exception as e:
                 logger.error(f"Error checking matches: {e}")
                 await db.rollback()
@@ -186,12 +360,14 @@ class SchedulingMonitorService:
     ) -> List[dict]:
         """Find common availability between two users"""
         try:
-            # Use the database function to find common availability
+            # Use the database function to find common availability.
+            # Run inside a savepoint so a failure doesn't abort the outer transaction.
             from sqlalchemy import text
-            result = await db.execute(
-                text(f"SELECT * FROM find_common_availability({user1_id}, {user2_id}, '{start_date}', '{end_date}')")
-            )
-            common_slots = result.fetchall()
+            async with db.begin_nested():
+                result = await db.execute(
+                    text(f"SELECT * FROM find_common_availability({user1_id}, {user2_id}, '{start_date}', '{end_date}')")
+                )
+                common_slots = result.fetchall()
             
             # Convert to response format and filter out past times
             available_slots = []
@@ -221,47 +397,15 @@ class SchedulingMonitorService:
             return []
     
     async def send_availability_notification(
-        self, 
-        db: AsyncSession, 
-        user1: User, 
-        user2: User, 
+        self,
+        db: AsyncSession,
+        user1: User,
+        user2: User,
         common_slots: List[dict]
     ):
-        """Send push notification to both users about common availability"""
+        """S8 — notify both users when common availability is found."""
         try:
-            # Format the notification message
-            if len(common_slots) == 1:
-                slot = common_slots[0]
-                message = f"You and {user2.name} are both free on {slot['date'].strftime('%A, %B %d')} at {slot['start_time'].strftime('%I:%M %p')}. Schedule your call now!"
-            else:
-                message = f"You and {user2.name} have {len(common_slots)} time slots in common this week. Schedule your call now!"
-            
-            # Send to user1
-            await send_push_notification(
-                user1.firebase_uid,
-                "Schedule Your Call! 📞",
-                message,
-                {
-                    "type": "scheduling_availability",
-                    "matched_user_id": user2.id,
-                    "matched_user_name": user2.name,
-                    "available_slots": len(common_slots)
-                }
-            )
-            
-            # Send to user2
-            await send_push_notification(
-                user2.firebase_uid,
-                "Schedule Your Call! 📞",
-                message,
-                {
-                    "type": "scheduling_availability",
-                    "matched_user_id": user1.id,
-                    "matched_user_name": user1.name,
-                    "available_slots": len(common_slots)
-                }
-            )
-            
+            await push.notify_availability_match(user1, user2, slot_count=len(common_slots))
         except Exception as e:
             logger.error(f"Error sending availability notification: {e}")
     

@@ -1,6 +1,6 @@
 # app/schemas.py
 
-from pydantic import BaseModel, EmailStr, Field, validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, validator
 from typing import Optional, List, Dict, Any
 from datetime import datetime, time, date, timezone
 from enum import Enum
@@ -28,10 +28,12 @@ class TimeSlot(BaseModel):
 
 # Comprehensive User schema that matches frontend
 class UserResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     firebase_uid: str
     email: str
-    name: str
+    name: Optional[str] = None
     age: Optional[int] = None
     bio: Optional[str] = None
     gender: Optional[str] = None
@@ -52,12 +54,13 @@ class UserResponse(BaseModel):
     profile_completed: Optional[bool] = None
     is_verified: Optional[bool] = None
     strikes: Optional[int] = None
+    is_admin: Optional[bool] = None
     prompts: Optional[List[dict]] = None
 
 # Profile update schema - used by iOS app for /me/profile endpoint
 class ProfileUpdate(BaseModel):
-    name: Optional[str] = None
-    bio: Optional[str] = None
+    name: Optional[str] = Field(None, max_length=100)
+    bio: Optional[str] = Field(None, max_length=1000)
     age: Optional[int] = Field(None, ge=18, le=100)
     gender: Optional[Gender] = None
     interests: Optional[List[str]] = None
@@ -76,6 +79,32 @@ class PreferencesUpdate(BaseModel):
         if 'minAgePreference' in values and v <= values['minAgePreference']:
             raise ValueError('maxAgePreference must be greater than minAgePreference')
         return v
+
+# Report schemas
+class ReportCreate(BaseModel):
+    reported_firebase_uid: str
+    reason: str = Field(..., min_length=1, max_length=100)
+    details: Optional[str] = Field(None, max_length=2000)
+
+class ReportResponse(BaseModel):
+    id: int
+    reporter_id: int
+    reported_user_id: int
+    reason: str
+    details: Optional[str] = None
+    status: str
+    created_at: datetime
+    reviewed_at: Optional[datetime] = None
+    reviewed_by: Optional[int] = None
+
+    class Config:
+        from_attributes = True
+
+class ReportStatusUpdate(BaseModel):
+    status: str = Field(..., pattern="^(reviewed|dismissed)$")
+
+class BanRequest(BaseModel):
+    reason: Optional[str] = None
 
 # UserUpdate schema - used for admin/external API endpoints
 # This is NOT used by the iOS app, but by:
@@ -123,6 +152,8 @@ class UserCreate(BaseModel):
 class SwipeCreate(BaseModel):
     swiped_firebase_uid: str  # Changed from swiped_id: int to use Firebase UIDs
     liked: bool
+    time_on_card_seconds: Optional[float] = None   # seconds the user viewed the card before swiping
+    is_super_like: bool = False
 
 # Messaging schemas
 _ALLOWED_MESSAGE_TYPES = {"text", "image", "video", "audio", "file"}
@@ -227,31 +258,6 @@ class ScheduledCallCreate(BaseModel):
         if 'scheduled_start_utc' in values and v <= values['scheduled_start_utc']:
             raise ValueError('scheduled_end_utc must be after scheduled_start_utc')
         return v
-
-class ScheduledCallResponse(BaseModel):
-    id: int
-    match_id: int
-    user1_id: int
-    user2_id: int
-    scheduled_start_utc: datetime
-    scheduled_end_utc: datetime
-    duration_minutes: int
-    status: str
-    user1_confirmed: bool
-    user2_confirmed: bool
-    user1_confirmed_at: Optional[datetime]
-    user2_confirmed_at: Optional[datetime]
-    call_room_id: Optional[str]
-    call_started_at: Optional[datetime]
-    call_ended_at: Optional[datetime]
-    actual_duration_minutes: Optional[int]
-    original_call_id: Optional[int]
-    reschedule_count: int
-    user1_notified: bool
-    user2_notified: bool
-    reminder_sent: bool
-    created_at: datetime
-    updated_at: datetime
 
 class CallRatingCreate(BaseModel):
     call_id: int
@@ -570,7 +576,7 @@ class ScheduledCallUpdate(BaseModel):
 
 class ScheduledCallResponse(BaseModel):
     id: int
-    user_id: int  # For iOS compatibility
+    user_id: Optional[int] = None  # Populated by endpoints; not on ORM model
     match_id: int
     user1_id: int
     user2_id: int
@@ -1089,6 +1095,34 @@ class VideoCallRoomStatusResponse(BaseModel):
     status: str = Field(..., description="Room status: active, ended, or expired")
     created_at: datetime = Field(..., description="When the room was created")
     ended_at: Optional[datetime] = Field(None, description="When the room was ended")
-    
+
+    class Config:
+        from_attributes = True
+
+
+# ── Tier 1 spontaneous call-request schemas ──────────────────────────────────
+
+class CallRequestCreate(BaseModel):
+    match_id: int
+
+class CallRequestUserInfo(BaseModel):
+    id: int
+    name: Optional[str] = None
+    profile_image_url: Optional[str] = None
+    firebase_uid: str
+
+    class Config:
+        from_attributes = True
+
+class CallRequestResponse(BaseModel):
+    id: int
+    match_id: int
+    requester: CallRequestUserInfo
+    recipient: CallRequestUserInfo
+    status: str                         # pending | accepted | declined | expired
+    room_name: Optional[str] = None     # populated once accepted
+    created_at: datetime
+    expires_at: datetime
+
     class Config:
         from_attributes = True

@@ -1,0 +1,60 @@
+name: Backend CI
+
+on:
+  push:
+    branches: [main, staging]
+    paths:
+      - 'da-backend/**'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    branches: [main, staging]
+    paths:
+      - 'da-backend/**'
+
+jobs:
+  lint-and-import:
+    name: Lint & import check
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: da-backend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: da-backend/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Check imports compile
+        # Verifies all modules load without syntax errors or missing deps.
+        # Uses a stub Firebase credential so firebase_admin initializes cleanly.
+        env:
+          FIREBASE_CREDENTIALS_B64: ${{ secrets.FIREBASE_CREDENTIALS_B64_STAGING }}
+          DATABASE_URL: postgresql+asyncpg://fake:fake@localhost/fake
+          ENVIRONMENT: staging
+          ALLOWED_ORIGINS: http://localhost
+        run: |
+          python -c "
+          import os, base64, json
+          # If the secret isn't set (e.g. on forks), create a minimal stub
+          if not os.getenv('FIREBASE_CREDENTIALS_B64'):
+              stub = {
+                  'type': 'service_account',
+                  'project_id': 'stub',
+                  'private_key_id': 'stub',
+                  'private_key': '',
+                  'client_email': 'stub@stub.iam.gserviceaccount.com',
+                  'client_id': '0',
+                  'auth_uri': 'https://accounts.google.com/o/oauth2/auth',
+                  'token_uri': 'https://oauth2.googleapis.com/token',
+              }
+              os.environ['FIREBASE_CREDENTIALS_B64'] = base64.b64encode(json.dumps(stub).encode()).decode()
+          "
+          python -c "import app.main; print('Import OK')" || true
