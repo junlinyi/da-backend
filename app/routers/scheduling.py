@@ -10,10 +10,10 @@ from datetime import datetime, time, date, timedelta, timezone
 import pytz
 from app.database import get_db
 from app.models import (
-    User, UserWeeklyAvailability, UserAvailabilityOverride, 
+    User, UserWeeklyAvailability, UserAvailabilityOverride,
     UserTimezone, UserSchedulingPreferences, ScheduledCall, Match,
     UserMatchCallPreferences, SchedulingProposal, ProposalTimeSlot,
-    ProposalResponse, CounterProposalTimeSlot
+    ProposalResponse, CounterProposalTimeSlot, MatchOutcome
 )
 from app.schemas import (
     UserWeeklyAvailabilityCreate, UserWeeklyAvailabilityResponse,
@@ -38,6 +38,7 @@ import logging
 import traceback
 import firebase_admin
 from firebase_admin import auth as firebase_auth
+from app.services import push_notification_service as push
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -633,15 +634,7 @@ async def get_my_calls(
     upcoming: bool = Query(True, description="Get upcoming calls (True) or past calls (False)")
 ):
     """Get user's scheduled calls with user names"""
-    # Join with User table to get names
-    query = select(
-        ScheduledCall,
-        User.name.label('user1_name'),
-        User.name.label('user2_name')
-    ).join(
-        User, 
-        (User.id == ScheduledCall.user1_id) | (User.id == ScheduledCall.user2_id)
-    ).where(
+    query = select(ScheduledCall).where(
         (ScheduledCall.user1_id == user.id) | (ScheduledCall.user2_id == user.id)
     )
     
@@ -649,9 +642,10 @@ async def get_my_calls(
         query = query.where(ScheduledCall.status == status)
     
     if upcoming:
-        query = query.where(ScheduledCall.scheduled_start_utc >= datetime.now(timezone.utc))
+        # Show calls that haven't ended yet (covers both future and currently-active calls)
+        query = query.where(ScheduledCall.scheduled_end_utc >= datetime.now(timezone.utc))
     else:
-        query = query.where(ScheduledCall.scheduled_start_utc < datetime.now(timezone.utc))
+        query = query.where(ScheduledCall.scheduled_end_utc < datetime.now(timezone.utc))
     
     query = query.order_by(ScheduledCall.scheduled_start_utc)
     result = await db.execute(query)
@@ -724,46 +718,78 @@ async def get_my_matches_without_calls(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Get user's matches that don't have scheduled calls yet"""
-    # Get all matches for this user
+    """Get user's unscheduled matches within the 48-hour scheduling window.
+
+    Returns only matches where:
+    - No scheduled call exists yet
+    - No pending proposal exists yet (those appear in /proposals)
+    - Match was created within the last 48 hours (Tier 2 window)
+
+    Each result includes `initiator_id` (the user who swiped / User A).
+    """
+    from datetime import datetime, timezone, timedelta
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
+
+    # Matches within the 48h window, excluding expired/blocked
     matches_query = select(Match).where(
-        (Match.user_id == user.id) | (Match.matched_user_id == user.id)
+        ((Match.user_id == user.id) | (Match.matched_user_id == user.id))
+        & (Match.created_at >= cutoff)
+        & (~Match.status.in_(["expired", "blocked", "rejected"]))
     )
     matches_result = await db.execute(matches_query)
     matches = matches_result.scalars().all()
-    
-    # Get all scheduled calls for this user
-    calls_query = select(ScheduledCall).where(
+
+    # Match IDs that already have scheduled calls (any status)
+    calls_query = select(ScheduledCall.match_id).where(
         (ScheduledCall.user1_id == user.id) | (ScheduledCall.user2_id == user.id)
     )
     calls_result = await db.execute(calls_query)
-    calls = calls_result.scalars().all()
-    
-    # Get match_ids that already have calls
-    scheduled_match_ids = {call.match_id for call in calls}
-    
-    # Filter matches to only include those without calls
+    scheduled_match_ids = {row[0] for row in calls_result.fetchall()}
+
+    # Match IDs that already have a pending proposal
+    from app.models import SchedulingProposal as ProposalModel
+    proposals_query = select(ProposalModel.match_id).where(
+        ((ProposalModel.proposer_id == user.id) | (ProposalModel.receiver_id == user.id))
+        & (ProposalModel.status == "pending")
+    )
+    proposals_result = await db.execute(proposals_query)
+    proposed_match_ids = {row[0] for row in proposals_result.fetchall()}
+
+    exclude_ids = scheduled_match_ids | proposed_match_ids
+
     unscheduled_matches = []
     for match in matches:
-        if match.id not in scheduled_match_ids:
-            # Get the other user's info
-            if match.user_id == user.id:
-                other_user_id = match.matched_user_id
-            else:
-                other_user_id = match.user_id
-            
-            other_user_query = await db.execute(select(User).where(User.id == other_user_id))
-            other_user = other_user_query.scalar_one_or_none()
-            
-            unscheduled_matches.append({
-                "id": match.id,  # iOS expects 'id' not 'match_id'
-                "user1_id": match.user_id,
-                "user2_id": match.matched_user_id,
-                "other_user_id": other_user_id,
-                "other_user_name": other_user.name if other_user else "Unknown User",
-                "created_at": match.created_at.isoformat() if match.created_at else None
-            })
-    
+        if match.id in exclude_ids:
+            continue
+
+        if match.user_id == user.id:
+            other_user_id = match.matched_user_id
+        else:
+            other_user_id = match.user_id
+
+        other_user_query = await db.execute(select(User).where(User.id == other_user_id))
+        other_user = other_user_query.scalar_one_or_none()
+
+        # Deadline for scheduling (48h from match creation)
+        deadline = None
+        if match.created_at:
+            dt = match.created_at
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            deadline = (dt + timedelta(hours=48)).isoformat()
+
+        unscheduled_matches.append({
+            "id": match.id,
+            "user1_id": match.user_id,           # initiator (swiped right)
+            "user2_id": match.matched_user_id,   # recipient
+            "initiator_id": match.user_id,        # explicit field: User A
+            "other_user_id": other_user_id,
+            "other_user_name": other_user.name if other_user else "Unknown User",
+            "created_at": match.created_at.isoformat() if match.created_at else None,
+            "scheduling_deadline": deadline,
+        })
+
     return unscheduled_matches
 
 @router.post("/calls", response_model=ScheduledCallResponse)
@@ -781,17 +807,44 @@ async def schedule_call(
         # Calculate end time from start time and duration
         scheduled_end_utc = call_data.scheduled_start_utc + timedelta(minutes=call_data.duration_minutes)
         logger.info(f"Checking conflicts for user1_id={call_data.user1_id}, user2_id={call_data.user2_id}, start={call_data.scheduled_start_utc}, end={scheduled_end_utc}")
-        # Check for scheduling conflicts using database function
-        conflict_check = await db.execute(
-            text("SELECT check_scheduling_conflict(:user_id, :start_time, :end_time)"),
-            {"user_id": call_data.user1_id, "start_time": call_data.scheduled_start_utc, "end_time": scheduled_end_utc}
-        )
-        user1_conflict = conflict_check.scalar()
-        conflict_check = await db.execute(
-            text("SELECT check_scheduling_conflict(:user_id, :start_time, :end_time)"),
-            {"user_id": call_data.user2_id, "start_time": call_data.scheduled_start_utc, "end_time": scheduled_end_utc}
-        )
-        user2_conflict = conflict_check.scalar()
+        # For immediate calls (start time within 2 minutes of now), skip availability check —
+        # the user is signaling "I'm available right now". Only block if there's an active call overlap.
+        now_utc = datetime.now(timezone.utc)
+        is_immediate = abs((call_data.scheduled_start_utc - now_utc).total_seconds()) <= 120
+        if is_immediate:
+            logger.info("Immediate call detected — skipping availability check, checking active call conflicts only")
+            conflict_check = await db.execute(
+                text("""SELECT EXISTS(
+                    SELECT 1 FROM scheduled_calls
+                    WHERE (user1_id = :user_id OR user2_id = :user_id)
+                      AND status IN ('scheduled', 'in_progress')
+                      AND (scheduled_start_utc < :end_time AND scheduled_end_utc > :start_time)
+                )"""),
+                {"user_id": call_data.user1_id, "start_time": call_data.scheduled_start_utc, "end_time": scheduled_end_utc}
+            )
+            user1_conflict = conflict_check.scalar()
+            conflict_check = await db.execute(
+                text("""SELECT EXISTS(
+                    SELECT 1 FROM scheduled_calls
+                    WHERE (user1_id = :user_id OR user2_id = :user_id)
+                      AND status IN ('scheduled', 'in_progress')
+                      AND (scheduled_start_utc < :end_time AND scheduled_end_utc > :start_time)
+                )"""),
+                {"user_id": call_data.user2_id, "start_time": call_data.scheduled_start_utc, "end_time": scheduled_end_utc}
+            )
+            user2_conflict = conflict_check.scalar()
+        else:
+            # Check for scheduling conflicts using database function
+            conflict_check = await db.execute(
+                text("SELECT check_scheduling_conflict(:user_id, :start_time, :end_time)"),
+                {"user_id": call_data.user1_id, "start_time": call_data.scheduled_start_utc, "end_time": scheduled_end_utc}
+            )
+            user1_conflict = conflict_check.scalar()
+            conflict_check = await db.execute(
+                text("SELECT check_scheduling_conflict(:user_id, :start_time, :end_time)"),
+                {"user_id": call_data.user2_id, "start_time": call_data.scheduled_start_utc, "end_time": scheduled_end_utc}
+            )
+            user2_conflict = conflict_check.scalar()
         logger.info(f"user1_conflict={user1_conflict}, user2_conflict={user2_conflict}")
         if user1_conflict or user2_conflict:
             logger.warning(f"Scheduling conflict detected for call: {call_data}")
@@ -810,6 +863,18 @@ async def schedule_call(
         await db.refresh(new_call)
         logger.info(f"Scheduled call {new_call.id} for users {call_data.user1_id} and {call_data.user2_id}")
 
+        # Update match_outcomes funnel: stamp call_scheduled_at (best-effort)
+        try:
+            outcome_q = await db.execute(
+                select(MatchOutcome).where(MatchOutcome.match_id == new_call.match_id)
+            )
+            outcome = outcome_q.scalar_one_or_none()
+            if outcome and outcome.call_scheduled_at is None:
+                outcome.call_scheduled_at = datetime.now(timezone.utc)
+                await db.commit()
+        except Exception as exc:
+            logger.warning(f"Failed to update match_outcomes.call_scheduled_at: {exc}")
+
         # Fetch user names for response
         user1_query = await db.execute(select(User).where(User.id == new_call.user1_id))
         user1 = user1_query.scalar_one_or_none()
@@ -821,9 +886,19 @@ async def schedule_call(
         if new_call.user1_id == user.id:
             other_user_name = user2.name if user2 else "Unknown User"
             other_user_id = new_call.user2_id
+            other_user = user2
         else:
             other_user_name = user1.name if user1 else "Unknown User"
             other_user_id = new_call.user1_id
+            other_user = user1
+
+        # S1 — notify the other participant that a call was just scheduled
+        try:
+            await push.notify_immediate_call_request(
+                recipient=other_user, caller=user, call_id=new_call.id
+            )
+        except Exception as exc:
+            logger.warning(f"[PUSH] S1 notification failed: {exc}")
 
         # Format datetime for iOS
         start_time_str = new_call.scheduled_start_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -1699,7 +1774,7 @@ async def debug_test_insert(db: AsyncSession = Depends(get_db)):
         await db.rollback()
         return {"error": str(e)}
 
-print("🔍 [DEBUG] Scheduling router loaded successfully - debug endpoint should be available")
+logger.debug("Scheduling router loaded")
 
 
 # ============================================================================
@@ -1782,6 +1857,16 @@ async def create_scheduling_proposal(
         )
         proposal_with_relations = result.scalar_one()
         
+        # S2 — notify the receiver that they have a new proposal to respond to
+        try:
+            await push.notify_proposal_received(
+                recipient=proposal_with_relations.receiver,
+                proposer=proposal_with_relations.proposer,
+                proposal_id=proposal_with_relations.id,
+            )
+        except Exception as exc:
+            logger.warning(f"[PUSH] S2 notification failed: {exc}")
+
         return SchedulingProposalResponse(
             id=proposal_with_relations.id,
             match_id=proposal_with_relations.match_id,
@@ -1806,7 +1891,7 @@ async def create_scheduling_proposal(
                 for slot in proposal_with_relations.time_slots
             ]
         )
-        
+
     except Exception as e:
         logger.error(f"Error creating proposal: {e}")
         await db.rollback()
@@ -2012,7 +2097,29 @@ async def respond_to_proposal(
             db.add(scheduled_call)
             await db.commit()
             await db.refresh(scheduled_call)
-            
+
+            # Update match_outcomes funnel: stamp call_scheduled_at (best-effort)
+            try:
+                outcome_q = await db.execute(
+                    select(MatchOutcome).where(MatchOutcome.match_id == scheduled_call.match_id)
+                )
+                outcome = outcome_q.scalar_one_or_none()
+                if outcome and outcome.call_scheduled_at is None:
+                    outcome.call_scheduled_at = datetime.now(timezone.utc)
+                    await db.commit()
+            except Exception as exc:
+                logger.warning(f"Failed to update match_outcomes.call_scheduled_at on proposal accept: {exc}")
+
+            # S3 — notify the proposer that their proposal was accepted
+            try:
+                await push.notify_proposal_accepted(
+                    proposer=proposal.proposer,
+                    accepter=proposal.receiver,
+                    call_id=scheduled_call.id,
+                )
+            except Exception as exc:
+                logger.warning(f"[PUSH] S3 notification failed: {exc}")
+
             # Return the scheduled call with proposal details
             return ScheduledCallFromProposal(
                 call=ScheduledCallResponse(
@@ -2075,7 +2182,15 @@ async def respond_to_proposal(
             proposal.status = ProposalStatus.REJECTED
             proposal.responded_at = datetime.now(timezone.utc)
             await db.commit()
-            
+
+            # S4 — notify the proposer that their proposal was rejected
+            try:
+                await push.notify_proposal_rejected(
+                    proposer=proposal.proposer, rejecter=proposal.receiver
+                )
+            except Exception as exc:
+                logger.warning(f"[PUSH] S4 notification failed: {exc}")
+
         elif response_data.response_type == ProposalResponseType.COUNTER_PROPOSE:
             # Add counter proposal time slots
             if response_data.counter_time_slots:
@@ -2086,10 +2201,20 @@ async def respond_to_proposal(
                         end_time=counter_slot_data.end_time
                     )
                     db.add(counter_slot)
-            
+
             proposal.status = ProposalStatus.COUNTER_PROPOSED
             proposal.responded_at = datetime.now(timezone.utc)
             await db.commit()
+
+            # S9 — notify the original proposer of the counter-proposal
+            try:
+                await push.notify_counter_proposal_received(
+                    recipient=proposal.proposer,
+                    proposer=proposal.receiver,
+                    proposal_id=proposal.id,
+                )
+            except Exception as exc:
+                logger.warning(f"[PUSH] S9 notification failed: {exc}")
         
         # For reject and counter-propose, return empty call but with proposal details
         return ScheduledCallFromProposal(
@@ -2127,3 +2252,277 @@ async def respond_to_proposal(
         if isinstance(e, HTTPException):
             raise
         raise HTTPException(status_code=500, detail="Failed to respond to proposal")
+
+
+# ============================================================================
+# TIER 1 — SPONTANEOUS CALL REQUESTS (post-match 5-minute window)
+# ============================================================================
+
+@router.post("/call-requests", response_model=dict)
+async def create_call_request(
+    body: dict,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    User B (the one whose swipe triggered the match) sends a live call request
+    to User A.  Expires automatically after 5 minutes.
+    """
+    from app.models import CallRequest, Match
+    from app.schemas import CallRequestCreate
+    from datetime import timedelta
+
+    match_id = body.get("match_id")
+    if not match_id:
+        raise HTTPException(status_code=422, detail="match_id required")
+
+    # Verify the match exists and the caller is a participant
+    match_result = await db.execute(
+        select(Match).where(
+            Match.id == match_id,
+            ((Match.user_id == user.id) | (Match.matched_user_id == user.id)),
+        )
+    )
+    match = match_result.scalar_one_or_none()
+    if not match:
+        raise HTTPException(status_code=404, detail="Match not found or you are not a participant")
+
+    # Determine recipient (the other person in the match)
+    recipient_id = match.matched_user_id if match.user_id == user.id else match.user_id
+
+    # Only allow one pending request per match at a time
+    existing = await db.execute(
+        select(CallRequest).where(
+            CallRequest.match_id == match_id,
+            CallRequest.status == "pending",
+        )
+    )
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=409, detail="A pending call request already exists for this match")
+
+    now = datetime.now(timezone.utc)
+    call_request = CallRequest(
+        match_id=match_id,
+        requester_id=user.id,
+        recipient_id=recipient_id,
+        status="pending",
+        expires_at=now + timedelta(minutes=5),
+    )
+    db.add(call_request)
+    await db.commit()
+    await db.refresh(call_request)
+
+    logger.info(f"call_request {call_request.id}: created by user {user.id} for match {match_id}")
+    return {"id": call_request.id, "expires_at": call_request.expires_at.isoformat(), "status": "pending"}
+
+
+@router.get("/call-requests/incoming", response_model=list)
+async def get_incoming_call_requests(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    User A polls this to find pending call requests addressed to them.
+    Auto-expires stale requests at read time.
+    """
+    from app.models import CallRequest
+
+    now = datetime.now(timezone.utc)
+
+    # Auto-expire any overdue pending requests
+    overdue = await db.execute(
+        select(CallRequest).where(
+            CallRequest.recipient_id == user.id,
+            CallRequest.status == "pending",
+            CallRequest.expires_at < now,
+        )
+    )
+    for req in overdue.scalars().all():
+        req.status = "expired"
+    await db.commit()
+
+    # Return remaining live pending requests
+    result = await db.execute(
+        select(CallRequest).where(
+            CallRequest.recipient_id == user.id,
+            CallRequest.status == "pending",
+        )
+    )
+    requests = result.scalars().all()
+
+    output = []
+    for req in requests:
+        requester_result = await db.execute(select(User).where(User.id == req.requester_id))
+        requester = requester_result.scalar_one_or_none()
+        output.append({
+            "id": req.id,
+            "match_id": req.match_id,
+            "status": req.status,
+            "expires_at": req.expires_at.isoformat(),
+            "requester": {
+                "id": requester.id if requester else req.requester_id,
+                "name": requester.name if requester else "Unknown",
+                "profile_image_url": requester.profile_image_url if requester else None,
+                "firebase_uid": requester.firebase_uid if requester else "",
+            },
+        })
+    return output
+
+
+@router.get("/call-requests/{request_id}", response_model=dict)
+async def get_call_request_status(
+    request_id: int,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    User B polls this to check whether User A has accepted/declined.
+    Also auto-expires at read time and returns room_name when accepted.
+    """
+    from app.models import CallRequest
+
+    result = await db.execute(select(CallRequest).where(CallRequest.id == request_id))
+    req = result.scalar_one_or_none()
+    if not req:
+        raise HTTPException(status_code=404, detail="Call request not found")
+    if req.requester_id != user.id and req.recipient_id != user.id:
+        raise HTTPException(status_code=403, detail="Not your call request")
+
+    # Auto-expire if overdue
+    now = datetime.now(timezone.utc)
+    if req.status == "pending" and req.expires_at < now:
+        req.status = "expired"
+        await db.commit()
+
+    return {
+        "id": req.id,
+        "match_id": req.match_id,
+        "status": req.status,
+        "room_name": req.room_name,
+        "expires_at": req.expires_at.isoformat(),
+    }
+
+
+@router.post("/call-requests/{request_id}/accept", response_model=dict)
+async def accept_call_request(
+    request_id: int,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """User A accepts the call request. Returns the Twilio room name both clients should join."""
+    from app.models import CallRequest
+
+    result = await db.execute(select(CallRequest).where(CallRequest.id == request_id))
+    req = result.scalar_one_or_none()
+    if not req:
+        raise HTTPException(status_code=404, detail="Call request not found")
+    if req.recipient_id != user.id:
+        raise HTTPException(status_code=403, detail="Only the recipient can accept")
+    if req.status != "pending":
+        raise HTTPException(status_code=409, detail=f"Request is already {req.status}")
+
+    now = datetime.now(timezone.utc)
+    if req.expires_at < now:
+        req.status = "expired"
+        await db.commit()
+        raise HTTPException(status_code=410, detail="Call request has expired")
+
+    room_name = f"tier1-{request_id}"
+    req.status = "accepted"
+    req.room_name = room_name
+    await db.commit()
+
+    logger.info(f"call_request {request_id}: accepted by user {user.id}, room={room_name}")
+    return {"id": req.id, "status": "accepted", "room_name": room_name}
+
+
+@router.post("/call-requests/{request_id}/decline", response_model=dict)
+async def decline_call_request(
+    request_id: int,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """User A declines the call request."""
+    from app.models import CallRequest
+
+    result = await db.execute(select(CallRequest).where(CallRequest.id == request_id))
+    req = result.scalar_one_or_none()
+    if not req:
+        raise HTTPException(status_code=404, detail="Call request not found")
+    if req.recipient_id != user.id:
+        raise HTTPException(status_code=403, detail="Only the recipient can decline")
+    if req.status != "pending":
+        raise HTTPException(status_code=409, detail=f"Request is already {req.status}")
+
+    req.status = "declined"
+    await db.commit()
+
+    logger.info(f"call_request {request_id}: declined by user {user.id}")
+    return {"id": req.id, "status": "declined"}
+
+
+# ============================================================================
+# ADMIN / TESTING UTILITIES
+# ============================================================================
+
+@router.post("/admin/set-all-available")
+async def set_all_users_available_24_7(
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Testing utility: sets every user's default availability to 24/7.
+
+    Replaces all rows in user_default_availability with is_available=True
+    for every (day_of_week 0-6, hour 0-23, minute 0 or 30) combination,
+    and clears any per-week overrides so the defaults are always used.
+
+    The common-availability SQL functions read from user_default_availability
+    first (falling back to override), so after this call any two matched users
+    will always have common slots available for scheduling.
+    """
+    from app.models import UserDefaultAvailability, UserAvailabilityOverride
+    from sqlalchemy import delete
+
+    # Load all user IDs
+    result = await db.execute(select(User.id))
+    user_ids = [row[0] for row in result.fetchall()]
+
+    if not user_ids:
+        return {"message": "No users found", "users_updated": 0}
+
+    # Wipe existing default and override availability for all users
+    await db.execute(
+        delete(UserDefaultAvailability).where(UserDefaultAvailability.user_id.in_(user_ids))
+    )
+    await db.execute(
+        delete(UserAvailabilityOverride).where(UserAvailabilityOverride.user_id.in_(user_ids))
+    )
+
+    # Bulk-insert 336 slots (7 days × 24 hours × 2 half-hours) per user
+    slots = []
+    for user_id in user_ids:
+        for day in range(7):        # 0=Sunday … 6=Saturday
+            for hour in range(24):
+                for minute in (0, 30):
+                    slots.append(
+                        UserDefaultAvailability(
+                            user_id=user_id,
+                            day_of_week=day,
+                            hour=hour,
+                            minute=minute,
+                            is_available=True,
+                        )
+                    )
+
+    db.add_all(slots)
+    await db.commit()
+
+    logger.info(
+        f"set-all-available: inserted {len(slots)} availability slots "
+        f"for {len(user_ids)} users"
+    )
+    return {
+        "message": "All users set to 24/7 available",
+        "users_updated": len(user_ids),
+        "slots_inserted": len(slots),
+    }

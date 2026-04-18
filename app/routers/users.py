@@ -106,7 +106,19 @@ async def update_profile(
 
     # Update only the fields that are provided
     for key, value in profile.dict(exclude_unset=True).items():
-        setattr(user, key, value)
+        if key == 'location' and isinstance(value, dict):
+            # Location is a nested object — map to flat DB columns
+            user.location = value.get('city')
+            if value.get('latitude') is not None:
+                user.latitude = value['latitude']
+            if value.get('longitude') is not None:
+                user.longitude = value['longitude']
+            if value.get('state') is not None:
+                user.state = value['state']
+        elif key == 'profileImageURL':
+            user.profile_image_url = value
+        else:
+            setattr(user, key, value)
 
     await db.commit()
     await db.refresh(user)
@@ -138,9 +150,37 @@ async def update_preferences(
     logger.info(f"Updated preferences for user {user.id}")
     return user
 
+@router.post("/me/device-token")
+async def register_device_token(
+    payload: dict = Body(...),
+    decoded_token=Depends(verify_firebase_token),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Register or update the APNs/FCM device token for the authenticated user.
+    Called by the iOS app on every launch after notification permission is granted.
+
+    Body: { "device_token": "<hex token string>" }
+    """
+    token = payload.get("device_token", "").strip()
+    if not token:
+        raise HTTPException(status_code=422, detail="device_token is required")
+
+    firebase_uid = decoded_token["uid"]
+    result = await db.execute(select(User).where(User.firebase_uid == firebase_uid))
+    user = result.scalars().first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user.device_token = token
+    await db.commit()
+    logger.info(f"[PUSH] Registered device token for user {user.id}")
+    return {"status": "ok"}
+
+
 @router.get("/{user_id}", response_model=UserResponse)
 async def get_profile(user_id: int, decoded_token=Depends(verify_firebase_token), db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(User).where(User.id == user_id))
+    result = await db.execute(select(User).where(User.id == user_id, User.deleted_at.is_(None)))
     user = result.scalars().first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -148,7 +188,7 @@ async def get_profile(user_id: int, decoded_token=Depends(verify_firebase_token)
 
 @router.put("/{user_id}", response_model=UserResponse)
 async def update_user_by_id(user_id: int, profile: UserUpdate, decoded_token=Depends(verify_firebase_token), db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(User).where(User.id == user_id))
+    result = await db.execute(select(User).where(User.id == user_id, User.deleted_at.is_(None)))
     user = result.scalars().first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -165,7 +205,8 @@ async def update_user_by_id(user_id: int, profile: UserUpdate, decoded_token=Dep
 
 @router.delete("/{user_id}")
 async def delete_account(user_id: int, decoded_token=Depends(verify_firebase_token), db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(User).where(User.id == user_id))
+    from datetime import datetime, timezone
+    result = await db.execute(select(User).where(User.id == user_id, User.deleted_at.is_(None)))
     user = result.scalars().first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -174,7 +215,19 @@ async def delete_account(user_id: int, decoded_token=Depends(verify_firebase_tok
     if user.firebase_uid != decoded_token["uid"]:
         raise HTTPException(status_code=403, detail="Not authorized to delete this user")
 
-    await db.delete(user)
+    # Soft delete: stamp deleted_at and scrub PII (GDPR)
+    now = datetime.now(timezone.utc)
+    user.deleted_at = now
+    user.is_active = False
+    user.email = f"deleted_{user.id}@deleted.invalid"
+    user.name = "Deleted User"
+    user.bio = None
+    user.profile_image_url = None
+    user.additional_image_urls = None
+    user.location = None
+    user.latitude = None
+    user.longitude = None
+    user.prompts = None
     await db.commit()
     return {"message": "User deleted successfully"}
 
@@ -238,7 +291,82 @@ async def block_user(
 
     await db.commit()
     logger.info(f"User {current_user.id} blocked user {blocked_user.id}")
+
+    # Archive the Firestore conversation so iOS stops showing it (SAFE-03)
+    try:
+        from firebase_admin import firestore as fs_admin
+        fs_db = fs_admin.client()
+        # Conversation doc is keyed by sorted UIDs: "{uid_a}_{uid_b}"
+        sorted_uids = "_".join(sorted([current_firebase_uid, blocked_firebase_uid]))
+        conv_ref = fs_db.collection("conversations").document(sorted_uids)
+        conv_ref.set({"archived": True, "active": False}, merge=True)
+        logger.info(f"Archived Firestore conversation {sorted_uids}")
+    except Exception as exc:
+        # Non-fatal: Postgres block already applied; log and continue
+        logger.warning(f"Failed to archive Firestore conversation on block: {exc}")
+
     return {"message": "User blocked successfully"}
+
+
+@router.post("/me/unblock/{blocked_firebase_uid}")
+async def unblock_user(
+    blocked_firebase_uid: str,
+    decoded_token=Depends(verify_firebase_token),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Unblock a user by their Firebase UID. Restores the match status to active
+    and reactivates the conversation.
+    """
+    current_firebase_uid = decoded_token["uid"]
+
+    if current_firebase_uid == blocked_firebase_uid:
+        raise HTTPException(status_code=400, detail="Cannot unblock yourself")
+
+    current_result = await db.execute(select(User).where(User.firebase_uid == current_firebase_uid))
+    current_user = current_result.scalars().first()
+    if not current_user:
+        raise HTTPException(status_code=404, detail="Current user not found")
+
+    blocked_result = await db.execute(select(User).where(User.firebase_uid == blocked_firebase_uid))
+    blocked_user = blocked_result.scalars().first()
+    if not blocked_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    match_result = await db.execute(
+        select(Match).where(
+            or_(
+                and_(Match.user_id == current_user.id, Match.matched_user_id == blocked_user.id),
+                and_(Match.user_id == blocked_user.id, Match.matched_user_id == current_user.id)
+            )
+        )
+    )
+    match = match_result.scalars().first()
+
+    if match:
+        if match.user_id == current_user.id:
+            match.user1_status = "active"
+        else:
+            match.user2_status = "active"
+        # Only restore match status if neither side is blocked
+        if match.user1_status == "active" and match.user2_status == "active":
+            match.status = "accepted"
+
+    conv_result = await db.execute(
+        select(Conversation).where(
+            or_(
+                and_(Conversation.user1_id == current_user.id, Conversation.user2_id == blocked_user.id),
+                and_(Conversation.user1_id == blocked_user.id, Conversation.user2_id == current_user.id)
+            )
+        )
+    )
+    conversation = conv_result.scalars().first()
+    if conversation:
+        conversation.is_active = True
+
+    await db.commit()
+    logger.info(f"User {current_user.id} unblocked user {blocked_user.id}")
+    return {"message": "User unblocked successfully"}
 
 
 @router.post("/create", response_model=UserResponse)

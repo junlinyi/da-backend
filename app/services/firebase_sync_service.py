@@ -185,9 +185,9 @@ class FirebaseSyncService:
                         select(Conversation).where(
                             ((Conversation.user1_id == min_id) & (Conversation.user2_id == max_id)) |
                             ((Conversation.user1_id == max_id) & (Conversation.user2_id == min_id))
-                        )
+                        ).limit(1)
                     )
-                    existing = existing_conv.scalar_one_or_none()
+                    existing = existing_conv.scalars().first()
                     
                     if not existing:
                         # Create new conversation
@@ -274,9 +274,9 @@ class FirebaseSyncService:
                         select(Conversation).where(
                             ((Conversation.user1_id == user1.id) & (Conversation.user2_id == user2.id)) |
                             ((Conversation.user1_id == user2.id) & (Conversation.user2_id == user1.id))
-                        )
+                        ).limit(1)
                     )
-                    pg_conversation = conv_result.scalar_one_or_none()
+                    pg_conversation = conv_result.scalars().first()
                     
                     if not pg_conversation:
                         continue

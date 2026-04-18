@@ -11,11 +11,25 @@ load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://dating_user:securepassword@localhost/dating_app")
 SYNC_DATABASE_URL = DATABASE_URL.replace("+asyncpg", "")
 
-# Create async engine
-engine = create_async_engine(DATABASE_URL, echo=False)
+# Create async engine with production-grade pool settings
+engine = create_async_engine(
+    DATABASE_URL,
+    echo=False,
+    pool_size=20,        # Base number of persistent connections
+    max_overflow=10,     # Extra connections allowed when pool is exhausted
+    pool_pre_ping=True,  # Test connection health before use (avoids stale-connection errors)
+    pool_recycle=3600,   # Recycle connections after 1 hour to avoid DB-side timeout drops
+)
 
 # Create sync engine for sync service
-sync_engine = create_engine(SYNC_DATABASE_URL, echo=False)
+sync_engine = create_engine(
+    SYNC_DATABASE_URL,
+    echo=False,
+    pool_size=5,
+    max_overflow=5,
+    pool_pre_ping=True,
+    pool_recycle=3600,
+)
 
 # Create session factory
 SessionLocal = sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)

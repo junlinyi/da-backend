@@ -2,14 +2,19 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from app.database import get_db
-from app.models import User, Message, Conversation
+from app.models import User, Message, Conversation, Match, MatchOutcome
+from sqlalchemy import or_
 from app.schemas import MessageCreate, MessageResponse, ConversationResponse
 from app.dependencies import verify_firebase_token
+from app.services import push_notification_service as push
 from typing import List
 from datetime import datetime, timezone
 import json
+import logging
 import firebase_admin
 from firebase_admin import firestore
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -22,6 +27,81 @@ async def test_conversations_format():
         "message": "Messaging API is working!",
         "note": "iOS app uses Firebase for real-time messaging. This endpoint is for testing only."
     }
+
+
+@router.post("/conversations/sync-matches")
+async def sync_match_conversations(
+    decoded_token=Depends(verify_firebase_token),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Ensures a Firestore conversation exists for every matched user in PostgreSQL.
+    Call this when the Messages tab loads so that manually-created matches (e.g.
+    seeded via admin/testing) show up in the conversation list without requiring
+    users to go through the swipe flow.
+    """
+    current_uid = decoded_token["uid"]
+
+    result = await db.execute(select(User).where(User.firebase_uid == current_uid))
+    current_user = result.scalar_one_or_none()
+    if not current_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    matches_result = await db.execute(
+        select(Match).where(
+            (Match.user_id == current_user.id) | (Match.matched_user_id == current_user.id)
+        )
+    )
+    matches = matches_result.scalars().all()
+
+    firestore_db = firestore.client()
+    synced = []
+
+    for match in matches:
+        other_id = match.matched_user_id if match.user_id == current_user.id else match.user_id
+        other_result = await db.execute(select(User).where(User.id == other_id))
+        other_user = other_result.scalar_one_or_none()
+        if not other_user:
+            continue
+
+        uid1 = current_uid
+        uid2 = other_user.firebase_uid
+
+        # Check whether a Firestore conversation already exists for these two users
+        conversations_ref = firestore_db.collection("conversations")
+        existing_stream = conversations_ref.where("participants", "array_contains", uid1).stream()
+
+        conversation_id = None
+        for doc in existing_stream:
+            data = doc.to_dict()
+            if uid2 in data.get("participants", []):
+                conversation_id = doc.id
+                break
+
+        if conversation_id is None:
+            # Create the missing Firestore conversation
+            conv_ref = conversations_ref.document()
+            conv_ref.set({
+                "participants": [uid1, uid2],
+                "lastMessage": "",
+                "lastMessageTime": firestore.SERVER_TIMESTAMP,
+                "unreadCounts": {uid1: 0, uid2: 0},
+                "createdAt": firestore.SERVER_TIMESTAMP,
+            })
+            conversation_id = conv_ref.id
+            logger.info(
+                f"sync_match_conversations: created Firestore conversation {conversation_id} "
+                f"for match {match.id} ({uid1} <-> {uid2})"
+            )
+
+        synced.append({
+            "match_id": match.id,
+            "conversation_id": conversation_id,
+            "other_user_firebase_uid": uid2,
+            "other_user_name": other_user.name,
+        })
+
+    return {"synced": synced, "total": len(synced)}
 
 # Note: The following endpoints are kept for potential future use or analytics:
 # - /conversations (GET) - Could be used for admin dashboard
@@ -201,13 +281,65 @@ async def send_message(
         
         # Also create message in PostgreSQL for analytics
         await create_message_in_postgresql(
-            conversation_id, 
-            current_user.id, 
-            message.content, 
+            conversation_id,
+            current_user.id,
+            message.content,
             message.message_type or 'text',
             db
         )
-        
+
+        # D2 — notify the recipient of the new message (best-effort, fire-and-forget)
+        try:
+            other_uid_for_push = next((uid for uid in participants if uid != current_user_firebase_uid), None)
+            if other_uid_for_push:
+                push_recipient_q = await db.execute(select(User).where(User.firebase_uid == other_uid_for_push))
+                push_recipient = push_recipient_q.scalar_one_or_none()
+                if push_recipient:
+                    preview = message.content or ""
+                    await push.notify_new_message(
+                        recipient=push_recipient,
+                        sender_name=current_user.name or "Someone",
+                        conversation_id=hash(conversation_id) & 0x7FFFFFFF,  # stable int for routing
+                        preview=preview,
+                    )
+        except Exception as exc:
+            logger.warning(f"[PUSH] D2 notification failed: {exc}")
+
+        # Update match_outcomes funnel timestamps (best-effort)
+        try:
+            other_uid = next((uid for uid in participants if uid != current_user_firebase_uid), None)
+            if other_uid:
+                other_q = await db.execute(select(User).where(User.firebase_uid == other_uid))
+                other_user = other_q.scalar_one_or_none()
+                if other_user:
+                    match_q = await db.execute(
+                        select(Match).where(
+                            or_(
+                                (Match.user_id == current_user.id) & (Match.matched_user_id == other_user.id),
+                                (Match.user_id == other_user.id) & (Match.matched_user_id == current_user.id),
+                            )
+                        )
+                    )
+                    match = match_q.scalar_one_or_none()
+                    if match:
+                        outcome_q = await db.execute(
+                            select(MatchOutcome).where(MatchOutcome.match_id == match.id)
+                        )
+                        outcome = outcome_q.scalar_one_or_none()
+                        if outcome:
+                            now = datetime.now(timezone.utc)
+                            if outcome.first_message_at is None:
+                                outcome.first_message_at = now
+                            elif outcome.reciprocal_msg_at is None:
+                                # First message was from the other user; this is the reply
+                                sender_is_user1 = (outcome.user1_id == current_user.id)
+                                first_sender_is_user1 = (match.user_id == outcome.user1_id)
+                                if sender_is_user1 != first_sender_is_user1:
+                                    outcome.reciprocal_msg_at = now
+                            await db.commit()
+        except Exception as exc:
+            logger.warning(f"Failed to update match_outcomes funnel on send_message: {exc}")
+
         return {
             "success": True,
             "message_id": message_ref[1].id,

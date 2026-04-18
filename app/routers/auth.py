@@ -10,6 +10,7 @@ from passlib.context import CryptContext
 from fastapi.security import OAuth2PasswordRequestForm
 from firebase_admin import auth
 from app.firebase import firebase_admin
+from app.limiter import limiter
 import logging
 
 # Set up logging
@@ -28,6 +29,7 @@ async def get_user_by_email(email: str, db: AsyncSession):
     return result.scalar_one_or_none()
 
 @router.post("/register", response_model=UserResponse)
+@limiter.limit("5/minute")
 async def register_user(
     user_data: UserCreate,
     request: Request,
