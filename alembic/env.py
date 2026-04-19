@@ -15,9 +15,18 @@ from app.models import Base, User  # 👈 this is key — it registers the User 
 config = context.config
 fileConfig(config.config_file_name)
 
-# Database URLs (sync for Alembic)
-DATABASE_URL = "postgresql+asyncpg://dating_user:securepassword@localhost/dating_app"
-SYNC_DATABASE_URL = "postgresql+psycopg2://dating_user:securepassword@localhost/dating_app"
+# Build sync URL from DATABASE_URL env var (normalize scheme for psycopg2)
+_raw_url = os.getenv(
+    "DATABASE_URL",
+    "postgresql://dating_user:securepassword@localhost/dating_app"
+)
+# Railway injects postgres:// or postgresql://; strip any async driver prefix
+if _raw_url.startswith("postgres://"):
+    SYNC_DATABASE_URL = _raw_url.replace("postgres://", "postgresql://", 1)
+elif _raw_url.startswith("postgresql+asyncpg://"):
+    SYNC_DATABASE_URL = _raw_url.replace("postgresql+asyncpg://", "postgresql://", 1)
+else:
+    SYNC_DATABASE_URL = _raw_url
 
 # Set target metadata
 target_metadata = Base.metadata
