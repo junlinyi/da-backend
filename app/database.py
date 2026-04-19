@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-_raw_url = os.getenv("DATABASE_URL", "postgresql+asyncpg://dating_user:securepassword@localhost/dating_app")
+_raw_url = os.getenv("DATABASE_URL", "postgresql+asyncpg://dating_user:securepassword@localhost/dating_app").strip()
 
 # Normalize to async URL — Railway injects postgresql:// or postgres://, asyncpg needs postgresql+asyncpg://
 if _raw_url.startswith("postgres://"):

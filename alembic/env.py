@@ -19,7 +19,7 @@ fileConfig(config.config_file_name)
 _raw_url = os.getenv(
     "DATABASE_URL",
     "postgresql://dating_user:securepassword@localhost/dating_app"
-)
+).strip()
 # Railway injects postgres:// or postgresql://; strip any async driver prefix
 if _raw_url.startswith("postgres://"):
     SYNC_DATABASE_URL = _raw_url.replace("postgres://", "postgresql://", 1)
