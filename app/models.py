@@ -1,7 +1,7 @@
 # app/models.py
 
 from datetime import datetime, time, date
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Boolean, Text, Float, func, ARRAY, UniqueConstraint, Time, Date, CheckConstraint, JSON
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Boolean, Text, Float, func, ARRAY, UniqueConstraint, Time, Date, CheckConstraint, JSON, Index
 from sqlalchemy.orm import relationship
 from app.database import Base
 
@@ -46,6 +46,11 @@ class User(Base):
     # Timezone
     timezone = Column(String, default='UTC')
 
+    # Premium
+    is_premium = Column(Boolean, nullable=False, default=False)
+    premium_expires_at = Column(DateTime(timezone=True), nullable=True)
+    last_weekly_boost_granted = Column(Date, nullable=True)
+
     # Accountability tracking
     no_show_count = Column(Integer, default=0, nullable=False)
     last_no_show_at = Column(DateTime(timezone=True), nullable=True)
@@ -56,20 +61,13 @@ class User(Base):
     # Relationships
     reports_filed = relationship("Report", foreign_keys="Report.reporter_id", back_populates="reporter", cascade="all, delete-orphan")
     reports_received = relationship("Report", foreign_keys="Report.reported_user_id", back_populates="reported_user", cascade="all, delete-orphan")
-    weekly_availability = relationship("UserWeeklyAvailability", back_populates="user", cascade="all, delete-orphan")
-    availability_overrides = relationship("UserAvailabilityOverride", back_populates="user", cascade="all, delete-orphan")
-    timezone_info = relationship("UserTimezone", back_populates="user", uselist=False, cascade="all, delete-orphan")
     scheduling_preferences = relationship("UserSchedulingPreferences", back_populates="user", uselist=False, cascade="all, delete-orphan")
-    
+
     # Call relationships
     scheduled_calls_as_user1 = relationship("ScheduledCall", foreign_keys="ScheduledCall.user1_id", back_populates="user1")
     scheduled_calls_as_user2 = relationship("ScheduledCall", foreign_keys="ScheduledCall.user2_id", back_populates="user2")
     call_ratings_given = relationship("CallRating", foreign_keys="CallRating.rater_id", back_populates="rater")
     call_ratings_received = relationship("CallRating", foreign_keys="CallRating.rated_user_id", back_populates="rated_user")
-    
-    # When2Meet style availability relationships
-    default_availability = relationship("UserDefaultAvailability", back_populates="user", cascade="all, delete-orphan")
-    override_availability = relationship("UserOverrideAvailability", back_populates="user", cascade="all, delete-orphan")
 
     # ML matchmaking relationships
     values_profile = relationship("UserValues", back_populates="user", uselist=False, cascade="all, delete-orphan")
@@ -145,58 +143,6 @@ class Message(Base):
 
 
 # Video Call Scheduling Models
-
-class UserWeeklyAvailability(Base):
-    __tablename__ = "user_weekly_availability"
-    
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    day_of_week = Column(Integer, nullable=False)  # 0=Sunday, 6=Saturday
-    start_time = Column(Time, nullable=False)  # Local time in user's timezone
-    end_time = Column(Time, nullable=False)  # Local time in user's timezone
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
-    
-    # Relationships
-    user = relationship("User", back_populates="weekly_availability")
-    
-    __table_args__ = (
-        UniqueConstraint('user_id', 'day_of_week', 'start_time', 'end_time', name='uq_user_day_time_slot'),
-    )
-
-
-class UserAvailabilityOverride(Base):
-    __tablename__ = "user_availability_overrides"
-    
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    date = Column(Date, nullable=False)  # Specific date
-    start_time = Column(Time, nullable=False)  # Local time in user's timezone
-    end_time = Column(Time, nullable=False)  # Local time in user's timezone
-    reason = Column(String(255), nullable=True)  # Optional reason for override
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    
-    # Relationships
-    user = relationship("User", back_populates="availability_overrides")
-    
-    __table_args__ = (
-        UniqueConstraint('user_id', 'date', 'start_time', 'end_time', name='uq_user_date_time_slot'),
-    )
-
-
-class UserTimezone(Base):
-    __tablename__ = "user_timezones"
-    
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, unique=True)
-    timezone = Column(String(50), nullable=False, default='UTC')  # e.g., 'America/New_York'
-    timezone_offset = Column(Integer, nullable=False, default=0)  # Offset in minutes from UTC
-    dst_enabled = Column(Boolean, nullable=False, default=False)  # Daylight saving time enabled
-    last_updated = Column(DateTime(timezone=True), server_default=func.now())
-    
-    # Relationships
-    user = relationship("User", back_populates="timezone_info")
-
 
 class ScheduledCall(Base):
     __tablename__ = "scheduled_calls"
@@ -301,85 +247,6 @@ class UserSchedulingPreferences(Base):
     
     # Relationships
     user = relationship("User", back_populates="scheduling_preferences")
-
-
-class UserMatchCallPreferences(Base):
-    __tablename__ = "user_match_call_preferences"
-    
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    matched_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    
-    # Call preference status
-    status = Column(String(20), nullable=False, default='pending')  # 'pending', 'wants_to_call', 'doesnt_want_to_call', 'already_called'
-    
-    # Timestamps
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
-    
-    # Metadata
-    last_common_availability_check = Column(DateTime(timezone=True), server_default=func.now())
-    last_notification_sent = Column(DateTime(timezone=True), nullable=True)
-    
-    # Unique constraint to prevent duplicate preferences
-    __table_args__ = (
-        UniqueConstraint('user_id', 'matched_user_id', name='uq_user_match_call_preference'),
-    )
-
-
-# ============================================================================
-# When2Meet Style Availability Models
-# ============================================================================
-
-class UserDefaultAvailability(Base):
-    """User's default weekly availability in 30-minute slots (When2Meet style)"""
-    __tablename__ = "user_default_availability"
-    
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    day_of_week = Column(Integer, nullable=False)  # 0-6 (Sunday-Saturday)
-    hour = Column(Integer, nullable=False)  # 0-23
-    minute = Column(Integer, nullable=False)  # 0 or 30 (30-minute slots)
-    is_available = Column(Boolean, nullable=False, default=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    
-    # Relationships
-    user = relationship("User", back_populates="default_availability")
-    
-    # Constraints
-    __table_args__ = (
-        CheckConstraint('day_of_week >= 0 AND day_of_week <= 6', name='valid_day_of_week'),
-        CheckConstraint('hour >= 0 AND hour <= 23', name='valid_hour'),
-        CheckConstraint('minute IN (0, 30)', name='valid_minute'),
-        UniqueConstraint('user_id', 'day_of_week', 'hour', 'minute', name='unique_user_time_slot'),
-    )
-
-
-class UserOverrideAvailability(Base):
-    """User's override availability for specific weeks (When2Meet style)"""
-    __tablename__ = "user_override_availability"
-    
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    week_start_date = Column(Date, nullable=False)  # YYYY-MM-DD format
-    day_of_week = Column(Integer, nullable=False)  # 0-6 (Sunday-Saturday)
-    hour = Column(Integer, nullable=False)  # 0-23
-    minute = Column(Integer, nullable=False)  # 0 or 30 (30-minute slots)
-    is_available = Column(Boolean, nullable=False, default=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    
-    # Relationships
-    user = relationship("User", back_populates="override_availability")
-    
-    # Constraints
-    __table_args__ = (
-        CheckConstraint('day_of_week >= 0 AND day_of_week <= 6', name='valid_day_of_week'),
-        CheckConstraint('hour >= 0 AND hour <= 23', name='valid_hour'),
-        CheckConstraint('minute IN (0, 30)', name='valid_minute'),
-        UniqueConstraint('user_id', 'week_start_date', 'day_of_week', 'hour', 'minute', name='unique_user_week_time_slot'),
-    )
 
 
 # ============================================================================
@@ -654,6 +521,48 @@ class MatchOutcome(Base):
     match = relationship("Match", backref="outcome")
     user1 = relationship("User", foreign_keys=[user1_id])
     user2 = relationship("User", foreign_keys=[user2_id])
+
+
+class PremiumUnlock(Base):
+    """Tracks daily profile unlocks by premium users from the Likes tab."""
+    __tablename__ = "premium_unlocks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    unlocked_user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    unlocked_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    # NULL = unlocked but not yet acted on; 'like' | 'pass' once responded
+    action = Column(String(10), nullable=True)
+    match_id = Column(Integer, ForeignKey("matches.id", ondelete="SET NULL"), nullable=True)
+
+    user = relationship("User", foreign_keys=[user_id])
+    unlocked_user = relationship("User", foreign_keys=[unlocked_user_id])
+    match = relationship("Match", foreign_keys=[match_id])
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "unlocked_user_id", name="uq_premium_unlock"),
+    )
+
+
+class ProfileBoost(Base):
+    """Tracks active profile boosts (premium weekly grant or à la carte purchase)."""
+    __tablename__ = "profile_boosts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    started_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    # 'premium_weekly' | 'alacarte'
+    source = Column(String(20), nullable=False)
+    # StoreKit transaction ID for à la carte; NULL for premium_weekly
+    purchase_token = Column(String(255), nullable=True)
+
+    user = relationship("User", foreign_keys=[user_id])
+
+    __table_args__ = (
+        CheckConstraint("expires_at > started_at", name="boost_expires_after_start"),
+        Index("idx_boosts_user_active", "user_id", "expires_at"),
+    )
 
 
 class VideoCallRoom(Base):

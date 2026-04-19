@@ -5,18 +5,14 @@ Checks for common availability between matched users and sends notifications
 
 import asyncio
 import logging
-from datetime import datetime, timedelta, date, timezone
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Tuple
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy.orm import selectinload
-from sqlalchemy import and_, or_
-import pytz
 
 from app.database import SessionLocal
 from app.models import (
-    User, Match, UserMatchCallPreferences, UserWeeklyAvailability,
-    UserAvailabilityOverride, ScheduledCall, UserTimezone, BehavioralEvent
+    User, Match, ScheduledCall, BehavioralEvent
 )
 from app.services import push_notification_service as push
 
@@ -244,7 +240,7 @@ class SchedulingMonitorService:
         return count
 
     async def check_all_matches(self):
-        """Check all pending matches for common availability and expire stale ones."""
+        """Run periodic scheduling housekeeping (expiry, no-show detection, expiry warnings)."""
         async for db in get_db_session():
             try:
                 # Expire matches that have passed the 48h scheduling window
@@ -256,233 +252,10 @@ class SchedulingMonitorService:
                 # S7 — warn users whose match window is almost closed
                 await self.notify_expiring_matches(db)
 
-                # Get all pending call preferences
-                result = await db.execute(
-                    select(UserMatchCallPreferences)
-                    .where(UserMatchCallPreferences.status == 'pending')
-                )
-                pending_preferences = result.scalars().all()
-
-                logger.info(f"Checking {len(pending_preferences)} pending call preferences")
-
-                for preference in pending_preferences:
-                    # Additional safety check: ensure no scheduled calls exist
-                    scheduled_call_result = await db.execute(
-                        select(ScheduledCall).where(
-                            and_(
-                                or_(
-                                    and_(ScheduledCall.user1_id == preference.user_id,
-                                         ScheduledCall.user2_id == preference.matched_user_id),
-                                    and_(ScheduledCall.user1_id == preference.matched_user_id,
-                                         ScheduledCall.user2_id == preference.user_id)
-                                ),
-                                ScheduledCall.status.in_(['scheduled', 'in_progress'])
-                            )
-                        ).limit(1)
-                    )
-                    existing_call = scheduled_call_result.scalars().first()
-
-                    if existing_call:
-                        logger.info(f"Skipping preference {preference.id}: call already scheduled for {existing_call.id}")
-                        # Update status to prevent future checks
-                        preference.status = 'wants_to_call'
-                        await db.commit()
-                        continue
-
-                    await self.check_match_availability(db, preference)
-
             except Exception as e:
                 logger.error(f"Error checking matches: {e}")
                 await db.rollback()
                 break
-    
-    async def check_match_availability(self, db: AsyncSession, preference: UserMatchCallPreferences):
-        """Check availability for a specific user-match pair"""
-        try:
-            # Get both users
-            user1_result = await db.execute(
-                select(User).where(User.id == preference.user_id)
-            )
-            user1 = user1_result.scalar_one_or_none()
-            
-            user2_result = await db.execute(
-                select(User).where(User.id == preference.matched_user_id)
-            )
-            user2 = user2_result.scalar_one_or_none()
-            
-            if not user1 or not user2:
-                logger.warning(f"User not found for preference {preference.id}")
-                return
-            
-            # Check if we should skip this check (cooldown period)
-            if preference.last_common_availability_check:
-                time_since_last_check = utc_now() - preference.last_common_availability_check
-                if time_since_last_check.total_seconds() < self.check_interval:
-                    return
-            
-            # Find common availability for next 7 days
-            start_date = date.today()
-            end_date = start_date + timedelta(days=7)
-            
-            common_slots = await self.find_common_availability(
-                db, user1.id, user2.id, start_date, end_date
-            )
-            
-            # Update last check time
-            preference.last_common_availability_check = utc_now()
-            await db.commit()
-            
-            if common_slots:
-                # Check if we should send notification (cooldown)
-                should_send = True
-                if preference.last_notification_sent:
-                    time_since_notification = utc_now() - preference.last_notification_sent
-                    if time_since_notification.total_seconds() < self.notification_cooldown:
-                        should_send = False
-                
-                if should_send:
-                    await self.send_availability_notification(db, user1, user2, common_slots)
-                    preference.last_notification_sent = utc_now()
-                    await db.commit()
-                    
-                    logger.info(f"Sent availability notification to users {user1.id} and {user2.id}")
-            
-        except Exception as e:
-            logger.error(f"Error checking availability for preference {preference.id}: {e}")
-    
-    async def find_common_availability(
-        self, 
-        db: AsyncSession, 
-        user1_id: int, 
-        user2_id: int, 
-        start_date: date, 
-        end_date: date
-    ) -> List[dict]:
-        """Find common availability between two users"""
-        try:
-            # Use the database function to find common availability.
-            # Run inside a savepoint so a failure doesn't abort the outer transaction.
-            from sqlalchemy import text
-            async with db.begin_nested():
-                result = await db.execute(
-                    text(f"SELECT * FROM find_common_availability({user1_id}, {user2_id}, '{start_date}', '{end_date}')")
-                )
-                common_slots = result.fetchall()
-            
-            # Convert to response format and filter out past times
-            available_slots = []
-            now = utc_now()
-            
-            for slot in common_slots:
-                # Convert date and time to UTC datetime (timezone-aware)
-                slot_start_utc = datetime.combine(slot.date, slot.start_time, timezone.utc)
-                slot_end_utc = datetime.combine(slot.date, slot.end_time, timezone.utc)
-                
-                # Only include future slots
-                if slot_start_utc > now:
-                    available_slots.append({
-                        "start_time_utc": slot_start_utc,
-                        "end_time_utc": slot_end_utc,
-                        "date": slot.date,
-                        "start_time": slot.start_time,
-                        "end_time": slot.end_time
-                    })
-            
-            # Sort by start time and take earliest 3
-            available_slots.sort(key=lambda x: x["start_time_utc"])
-            return available_slots[:3]
-            
-        except Exception as e:
-            logger.error(f"Error finding common availability: {e}")
-            return []
-    
-    async def send_availability_notification(
-        self,
-        db: AsyncSession,
-        user1: User,
-        user2: User,
-        common_slots: List[dict]
-    ):
-        """S8 — notify both users when common availability is found."""
-        try:
-            await push.notify_availability_match(user1, user2, slot_count=len(common_slots))
-        except Exception as e:
-            logger.error(f"Error sending availability notification: {e}")
-    
-    async def update_call_preference(
-        self, 
-        user_id: int, 
-        matched_user_id: int, 
-        status: str
-    ):
-        """Update call preference for a user-match pair"""
-        async for db in get_db_session():
-            try:
-                result = await db.execute(
-                    select(UserMatchCallPreferences).where(
-                        UserMatchCallPreferences.user_id == user_id,
-                        UserMatchCallPreferences.matched_user_id == matched_user_id
-                    )
-                )
-                preference = result.scalar_one_or_none()
-                
-                if preference:
-                    preference.status = status
-                    preference.updated_at = utc_now()
-                else:
-                    # Create new preference
-                    preference = UserMatchCallPreferences(
-                        user_id=user_id,
-                        matched_user_id=matched_user_id,
-                        status=status
-                    )
-                    db.add(preference)
-                
-                await db.commit()
-                logger.info(f"Updated call preference for user {user_id} with {matched_user_id}: {status}")
-                
-            except Exception as e:
-                logger.error(f"Error updating call preference: {e}")
-            finally:
-                await db.close()
-    
-    async def get_pending_matches_for_user(self, user_id: int) -> List[dict]:
-        """Get all pending matches for a user that want to call"""
-        async for db in get_db_session():
-            try:
-                result = await db.execute(
-                    select(UserMatchCallPreferences)
-                    .where(
-                        UserMatchCallPreferences.user_id == user_id,
-                        UserMatchCallPreferences.status == 'wants_to_call'
-                    )
-                )
-                preferences = result.scalars().all()
-                
-                matches = []
-                for pref in preferences:
-                    # Get the matched user
-                    matched_user_result = await db.execute(
-                        select(User).where(User.id == pref.matched_user_id)
-                    )
-                    matched_user = matched_user_result.scalar_one_or_none()
-                    
-                    if matched_user:
-                        matches.append({
-                            "matched_user_id": matched_user.id,
-                            "matched_user_name": matched_user.name,
-                            "matched_user_profile_image": matched_user.profile_image_url,
-                            "preference_created_at": pref.created_at,
-                            "last_availability_check": pref.last_common_availability_check
-                        })
-                
-                return matches
-                
-            except Exception as e:
-                logger.error(f"Error getting pending matches: {e}")
-                return []
-            finally:
-                await db.close()
 
 # Global instance
 scheduling_monitor = SchedulingMonitorService()
