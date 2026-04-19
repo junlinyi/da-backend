@@ -15,6 +15,5 @@ greenlet>=3.0.0  # Required for SQLAlchemy async functionality
 geopy==2.4.1
 twilio>=8.10.0
 pytz>=2024.1
-sentence-transformers>=3.0.0
 sentry-sdk[fastapi]>=2.0.0
 slowapi>=0.1.9
