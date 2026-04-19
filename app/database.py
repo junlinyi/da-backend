@@ -8,8 +8,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://dating_user:securepassword@localhost/dating_app")
-SYNC_DATABASE_URL = DATABASE_URL.replace("+asyncpg", "")
+_raw_url = os.getenv("DATABASE_URL", "postgresql+asyncpg://dating_user:securepassword@localhost/dating_app")
+
+# Normalize to async URL — Railway injects postgresql:// or postgres://, asyncpg needs postgresql+asyncpg://
+if _raw_url.startswith("postgres://"):
+    DATABASE_URL = _raw_url.replace("postgres://", "postgresql+asyncpg://", 1)
+elif _raw_url.startswith("postgresql://") and "+asyncpg" not in _raw_url:
+    DATABASE_URL = _raw_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+else:
+    DATABASE_URL = _raw_url
+
+# Sync URL strips the async driver back to standard postgresql://
+SYNC_DATABASE_URL = DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
 
 # Create async engine with production-grade pool settings
 engine = create_async_engine(
