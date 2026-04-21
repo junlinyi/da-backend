@@ -299,44 +299,24 @@ async def schedule_call(
         # Calculate end time from start time and duration
         scheduled_end_utc = call_data.scheduled_start_utc + timedelta(minutes=call_data.duration_minutes)
         logger.info(f"Checking conflicts for user1_id={call_data.user1_id}, user2_id={call_data.user2_id}, start={call_data.scheduled_start_utc}, end={scheduled_end_utc}")
-        # For immediate calls (start time within 2 minutes of now), skip availability check —
-        # the user is signaling "I'm available right now". Only block if there's an active call overlap.
-        now_utc = datetime.now(timezone.utc)
-        is_immediate = abs((call_data.scheduled_start_utc - now_utc).total_seconds()) <= 120
-        if is_immediate:
-            logger.info("Immediate call detected — skipping availability check, checking active call conflicts only")
-            conflict_check = await db.execute(
-                text("""SELECT EXISTS(
-                    SELECT 1 FROM scheduled_calls
-                    WHERE (user1_id = :user_id OR user2_id = :user_id)
-                      AND status IN ('scheduled', 'in_progress')
-                      AND (scheduled_start_utc < :end_time AND scheduled_end_utc > :start_time)
-                )"""),
-                {"user_id": call_data.user1_id, "start_time": call_data.scheduled_start_utc, "end_time": scheduled_end_utc}
-            )
-            user1_conflict = conflict_check.scalar()
-            conflict_check = await db.execute(
-                text("""SELECT EXISTS(
-                    SELECT 1 FROM scheduled_calls
-                    WHERE (user1_id = :user_id OR user2_id = :user_id)
-                      AND status IN ('scheduled', 'in_progress')
-                      AND (scheduled_start_utc < :end_time AND scheduled_end_utc > :start_time)
-                )"""),
-                {"user_id": call_data.user2_id, "start_time": call_data.scheduled_start_utc, "end_time": scheduled_end_utc}
-            )
-            user2_conflict = conflict_check.scalar()
-        else:
-            # Check for scheduling conflicts using database function
-            conflict_check = await db.execute(
-                text("SELECT check_scheduling_conflict(:user_id, :start_time, :end_time)"),
-                {"user_id": call_data.user1_id, "start_time": call_data.scheduled_start_utc, "end_time": scheduled_end_utc}
-            )
-            user1_conflict = conflict_check.scalar()
-            conflict_check = await db.execute(
-                text("SELECT check_scheduling_conflict(:user_id, :start_time, :end_time)"),
-                {"user_id": call_data.user2_id, "start_time": call_data.scheduled_start_utc, "end_time": scheduled_end_utc}
-            )
-            user2_conflict = conflict_check.scalar()
+        # Conflict check: only block if there's an OVERLAPPING ACTIVE call.
+        # Availability-grid logic was removed with the two-tier migration; the app now
+        # relies on user intent (they're signaling availability by tapping Call Now /
+        # Propose Times). We only need to prevent double-booking actually-live calls.
+        overlap_sql = text("""SELECT EXISTS(
+            SELECT 1 FROM scheduled_calls
+            WHERE (user1_id = :user_id OR user2_id = :user_id)
+              AND status IN ('scheduled', 'in_progress')
+              AND (scheduled_start_utc < :end_time AND scheduled_end_utc > :start_time)
+        )""")
+        user1_conflict = (await db.execute(
+            overlap_sql,
+            {"user_id": call_data.user1_id, "start_time": call_data.scheduled_start_utc, "end_time": scheduled_end_utc}
+        )).scalar()
+        user2_conflict = (await db.execute(
+            overlap_sql,
+            {"user_id": call_data.user2_id, "start_time": call_data.scheduled_start_utc, "end_time": scheduled_end_utc}
+        )).scalar()
         logger.info(f"user1_conflict={user1_conflict}, user2_conflict={user2_conflict}")
         if user1_conflict or user2_conflict:
             logger.warning(f"Scheduling conflict detected for call: {call_data}")
@@ -1174,10 +1154,14 @@ async def accept_call_request(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """User A accepts the call request. Returns the Twilio room name both clients should join."""
-    from app.models import CallRequest
+    """User A accepts the call request. Creates a ScheduledCall and returns the Twilio room name both clients should join."""
+    from app.models import CallRequest, ScheduledCall
+    from datetime import timedelta
 
-    result = await db.execute(select(CallRequest).where(CallRequest.id == request_id))
+    # SELECT FOR UPDATE to prevent two concurrent accepts from both succeeding
+    result = await db.execute(
+        select(CallRequest).where(CallRequest.id == request_id).with_for_update()
+    )
     req = result.scalar_one_or_none()
     if not req:
         raise HTTPException(status_code=404, detail="Call request not found")
@@ -1195,10 +1179,34 @@ async def accept_call_request(
     room_name = f"tier1-{request_id}"
     req.status = "accepted"
     req.room_name = room_name
-    await db.commit()
 
-    logger.info(f"call_request {request_id}: accepted by user {user.id}, room={room_name}")
-    return {"id": req.id, "status": "accepted", "room_name": room_name}
+    # Create the ScheduledCall row so the rest of the system (no-show detection,
+    # match_outcomes funnel, Upcoming Calls list) sees this Tier 1 call.
+    scheduled_call = ScheduledCall(
+        match_id=req.match_id,
+        user1_id=req.requester_id,
+        user2_id=req.recipient_id,
+        scheduled_start_utc=now,
+        scheduled_end_utc=now + timedelta(minutes=15),
+        duration_minutes=15,
+        status="in_progress",
+        call_room_id=room_name,
+        call_started_at=now,
+    )
+    db.add(scheduled_call)
+    await db.commit()
+    await db.refresh(scheduled_call)
+
+    logger.info(
+        f"call_request {request_id}: accepted by user {user.id}, "
+        f"room={room_name}, scheduled_call={scheduled_call.id}"
+    )
+    return {
+        "id": req.id,
+        "status": "accepted",
+        "room_name": room_name,
+        "scheduled_call_id": scheduled_call.id,
+    }
 
 
 @router.post("/call-requests/{request_id}/decline", response_model=dict)
