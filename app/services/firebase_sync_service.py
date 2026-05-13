@@ -82,10 +82,13 @@ class FirebaseSyncService:
                     existing_user = await self.get_user_by_firebase_uid(firebase_uid, db)
                     
                     if not existing_user:
-                        # Create new user in PostgreSQL
+                        # Create new user in PostgreSQL — accept whichever identifier
+                        # Firestore sync returned (email-auth users have email, phone-auth
+                        # users have phone_number, linked accounts may have both).
                         new_user = User(
                             firebase_uid=firebase_uid,
-                            email=user_data.get('email', ''),
+                            email=user_data.get('email') or None,
+                            phone_number=user_data.get('phone_number') or user_data.get('phoneNumber') or None,
                             name=user_data.get('name'),
                             age=user_data.get('age'),
                             gender=user_data.get('gender'),
@@ -109,6 +112,10 @@ class FirebaseSyncService:
                         # Update existing user with latest data from Firebase
                         existing_user.name = user_data.get('name', existing_user.name)
                         existing_user.email = user_data.get('email', existing_user.email)
+                        # Phone number can be linked post-creation; preserve if Firestore omits.
+                        _fb_phone = user_data.get('phone_number') or user_data.get('phoneNumber')
+                        if _fb_phone:
+                            existing_user.phone_number = _fb_phone
                         existing_user.age = user_data.get('age', existing_user.age)
                         existing_user.gender = user_data.get('gender', existing_user.gender)
                         existing_user.preferred_gender = user_data.get('preferredGender', existing_user.preferred_gender)

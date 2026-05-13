@@ -8,7 +8,8 @@ from app.database import DATABASE_URL, get_db
 from app.models import User, Match, Conversation
 from app.schemas import UserResponse, UserUpdate, ProfileUpdate, PreferencesUpdate
 from app.dependencies import verify_firebase_token
-from pydantic import BaseModel
+from pydantic import BaseModel, validator
+from typing import Optional
 import logging
 
 # Set up logging
@@ -19,24 +20,31 @@ router = APIRouter()
 
 class UserCreateRequest(BaseModel):
     firebase_uid: str
-    email: str
-    name: str = None
-    bio: str = None
-    age: int = None
-    gender: str = None
-    interests: str = None  # Will be converted to array
-    location: str = None
-    latitude: float = None
-    longitude: float = None
-    state: str = None
-    preferred_gender: str = None
-    min_age_preference: int = None
-    max_age_preference: int = None
-    max_distance_km: int = None
-    profile_image_url: str = None
-    additional_image_urls: str = None  # Will be converted to array
-    timezone: str = None
+    email: Optional[str] = None
+    phone_number: Optional[str] = None
+    name: Optional[str] = None
+    bio: Optional[str] = None
+    age: Optional[int] = None
+    gender: Optional[str] = None
+    interests: Optional[str] = None  # Will be converted to array
+    location: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    state: Optional[str] = None
+    preferred_gender: Optional[str] = None
+    min_age_preference: Optional[int] = None
+    max_age_preference: Optional[int] = None
+    max_distance_km: Optional[int] = None
+    profile_image_url: Optional[str] = None
+    additional_image_urls: Optional[str] = None  # Will be converted to array
+    timezone: Optional[str] = None
     
+    @validator('phone_number', always=True)
+    def require_email_or_phone(cls, v, values):
+        if not v and not values.get('email'):
+            raise ValueError('Either email or phone_number must be provided')
+        return v
+
     def to_user_dict(self):
         """Convert to dict with proper array fields for User model"""
         data = self.dict(exclude_unset=True)
@@ -55,17 +63,20 @@ class UserCreateRequest(BaseModel):
 async def get_my_profile(decoded_token=Depends(verify_firebase_token), db: AsyncSession = Depends(get_db)):
     firebase_uid = decoded_token["uid"]
     email = decoded_token.get("email")
+    phone_number = decoded_token.get("phone_number")
 
     result = await db.execute(select(User).where(User.firebase_uid == firebase_uid))
     user = result.scalars().first()
 
     if not user:
         logger.info("No user found — creating...")
-        user = User(firebase_uid=firebase_uid, email=email)
+        # Phone-auth tokens have phone_number but no email; email-auth tokens
+        # have email but no phone_number. Linked accounts can have both.
+        user = User(firebase_uid=firebase_uid, email=email, phone_number=phone_number)
         db.add(user)
         await db.commit()
         await db.refresh(user)
-        logger.info(f"User created with ID: {user.id}")
+        logger.info(f"User created with ID: {user.id} (email={email!r} phone={phone_number!r})")
     else:
         logger.info(f"User already exists with ID: {user.id}")
 
@@ -220,6 +231,7 @@ async def delete_account(user_id: int, decoded_token=Depends(verify_firebase_tok
     user.deleted_at = now
     user.is_active = False
     user.email = f"deleted_{user.id}@deleted.invalid"
+    user.phone_number = f"deleted_{user.id}_phone"
     user.name = "Deleted User"
     user.bio = None
     user.profile_image_url = None
@@ -375,7 +387,7 @@ async def create_user(
     decoded_token=Depends(verify_firebase_token),
     db: AsyncSession = Depends(get_db)
 ):
-    logger.info(f"[USER CREATE] Attempting to create/update user: {user.firebase_uid} {user.email}")
+    logger.info(f"[USER CREATE] Attempting to create/update user: {user.firebase_uid} email={user.email!r} phone={user.phone_number!r}")
     # Only allow creating/updating own user record
     if user.firebase_uid != decoded_token["uid"]:
         raise HTTPException(status_code=403, detail="firebase_uid must match authenticated user")

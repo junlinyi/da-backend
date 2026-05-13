@@ -222,10 +222,12 @@ async def sync_users(
             existing_user = result.scalar_one_or_none()
             
             if not existing_user:
-                # Create new user
+                # Create new user — accept either email or phone_number from Firestore;
+                # phone-only users have no email and vice versa.
                 new_user = User(
                     firebase_uid=firebase_uid,
-                    email=user_data.get('email', ''),
+                    email=user_data.get('email') or None,
+                    phone_number=user_data.get('phone_number') or user_data.get('phoneNumber') or None,
                     name=user_data.get('name'),
                     age=user_data.get('age'),
                     gender=user_data.get('gender'),

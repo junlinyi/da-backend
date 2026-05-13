@@ -32,7 +32,8 @@ class UserResponse(BaseModel):
 
     id: int
     firebase_uid: str
-    email: str
+    email: Optional[str] = None
+    phone_number: Optional[str] = None
     name: Optional[str] = None
     age: Optional[int] = None
     bio: Optional[str] = None
@@ -147,7 +148,14 @@ class UserUpdate(BaseModel):
 
 # Legacy schemas for backward compatibility
 class UserCreate(BaseModel):
-    email: EmailStr
+    email: Optional[EmailStr] = None
+    phone_number: Optional[str] = None
+
+    @validator('phone_number', always=True)
+    def require_email_or_phone(cls, v, values):
+        if not v and not values.get('email'):
+            raise ValueError('Either email or phone_number must be provided')
+        return v
 
 class SwipeCreate(BaseModel):
     swiped_firebase_uid: str  # Changed from swiped_id: int to use Firebase UIDs
@@ -256,7 +264,8 @@ class UserSchedulingPreferenceResponse(BaseModel):
     updated_at: datetime
 
 class UserBase(BaseModel):
-    email: EmailStr
+    email: Optional[EmailStr] = None
+    phone_number: Optional[str] = Field(None, max_length=32)
     name: Optional[str] = Field(None, max_length=100)
     bio: Optional[str] = Field(None, max_length=1000)
     age: Optional[int] = Field(None, ge=18, le=120)
@@ -278,6 +287,12 @@ class UserBase(BaseModel):
 
 class UserCreate(UserBase):
     firebase_uid: str
+
+    @validator('phone_number', always=True)
+    def require_email_or_phone(cls, v, values):
+        if not v and not values.get('email'):
+            raise ValueError('Either email or phone_number must be provided')
+        return v
 
 class UserUpdate(BaseModel):
     name: Optional[str] = Field(None, max_length=100)

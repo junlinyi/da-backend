@@ -39,9 +39,13 @@ async def get_current_user(decoded_token=Depends(verify_firebase_token), db: Asy
             logger.warning(f"[USER ON-DEMAND] User {firebase_uid} not found in Postgres. Attempting to fetch from Firebase...")
             try:
                 fb_user = firebase_auth.get_user(firebase_uid)
+                # Mirror /users/me lazy-create logic — Firebase's user record may
+                # have email, phone_number, or both depending on which provider
+                # the user signed in with (or linked).
                 user = User(
                     firebase_uid=firebase_uid,
                     email=fb_user.email,
+                    phone_number=getattr(fb_user, 'phone_number', None),
                     name=fb_user.display_name or None,
                     profile_image_url=fb_user.photo_url or None,
                     is_active=True
@@ -49,7 +53,7 @@ async def get_current_user(decoded_token=Depends(verify_firebase_token), db: Asy
                 db.add(user)
                 await db.commit()
                 await db.refresh(user)
-                logger.info(f"[USER ON-DEMAND] User {firebase_uid} created in Postgres from Firebase.")
+                logger.info(f"[USER ON-DEMAND] User {firebase_uid} created in Postgres from Firebase (email={fb_user.email!r} phone={getattr(fb_user, 'phone_number', None)!r}).")
             except IntegrityError:
                 # Race condition: another concurrent request created this user between our
                 # SELECT and INSERT. Roll back and re-query to get the existing row.
