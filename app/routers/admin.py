@@ -23,15 +23,21 @@ router = APIRouter()
 @router.get("/reports", response_model=list[ReportResponse])
 async def list_reports(
     status: str = Query("pending", pattern="^(pending|reviewed|dismissed|all)$"),
+    category: str | None = Query(None),
+    context: str | None = Query(None, pattern="^(chat|video_call|profile)$"),
     limit: int = Query(50, le=200),
     offset: int = Query(0, ge=0),
     admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db)
 ):
-    """List reports, optionally filtered by status. Defaults to pending only."""
+    """List reports, optionally filtered by status, category, and context. Defaults to pending only."""
     query = select(Report)
     if status != "all":
         query = query.where(Report.status == status)
+    if category:
+        query = query.where(Report.category == category)
+    if context:
+        query = query.where(Report.context == context)
     query = query.order_by(Report.created_at.desc()).offset(offset).limit(limit)
     result = await db.execute(query)
     return result.scalars().all()
@@ -155,7 +161,8 @@ async def get_report_detail(
     return {
         "report": {
             "id": report.id,
-            "reason": report.reason,
+            "category": report.category,
+            "context": report.context,
             "details": report.details,
             "status": report.status,
             "created_at": report.created_at,
@@ -175,7 +182,7 @@ async def get_report_detail(
             "profile_image_url": reported.profile_image_url if reported else None,
         },
         "prior_reports": [
-            {"id": r.id, "reason": r.reason, "status": r.status, "created_at": r.created_at}
+            {"id": r.id, "category": r.category, "context": r.context, "status": r.status, "created_at": r.created_at}
             for r in prior_reports
         ],
         "recent_calls": [
@@ -283,7 +290,8 @@ async def get_user_admin_view(
             {
                 "id": r.id,
                 "reporter_id": r.reporter_id,
-                "reason": r.reason,
+                "category": r.category,
+                "context": r.context,
                 "details": r.details,
                 "status": r.status,
                 "created_at": r.created_at,

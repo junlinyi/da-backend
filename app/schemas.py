@@ -82,16 +82,46 @@ class PreferencesUpdate(BaseModel):
         return v
 
 # Report schemas
+# Structured report taxonomy (REPORTING_CATEGORIES_SPEC.md). Replaces the
+# legacy free-text `reason`. `details` is required only when category = other.
+class ReportCategory(str, Enum):
+    harassment = "harassment"
+    inappropriate_photos = "inappropriate_photos"
+    explicit_on_video_call = "explicit_on_video_call"
+    underage = "underage"
+    impersonation = "impersonation"
+    scam_spam = "scam_spam"
+    hate_speech = "hate_speech"
+    violence_threat = "violence_threat"
+    off_platform_solicitation = "off_platform_solicitation"
+    other = "other"
+
+class ReportContext(str, Enum):
+    chat = "chat"
+    video_call = "video_call"
+    profile = "profile"
+
 class ReportCreate(BaseModel):
     reported_firebase_uid: str
-    reason: str = Field(..., min_length=1, max_length=100)
+    category: ReportCategory
+    context: ReportContext
     details: Optional[str] = Field(None, max_length=2000)
+
+    @validator('details', always=True)
+    def details_required_for_other(cls, v, values):
+        # `other` is the long-tail catch-all; force a meaningful description so
+        # admins can triage it. >=10 chars matches the iOS submit-gate.
+        if values.get('category') == ReportCategory.other:
+            if v is None or len(v.strip()) < 10:
+                raise ValueError('details (min 10 chars) are required when category is "other"')
+        return v
 
 class ReportResponse(BaseModel):
     id: int
     reporter_id: int
     reported_user_id: int
-    reason: str
+    category: ReportCategory
+    context: ReportContext
     details: Optional[str] = None
     status: str
     created_at: datetime

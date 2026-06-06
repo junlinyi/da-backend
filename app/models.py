@@ -345,7 +345,13 @@ class Report(Base):
     reporter_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     reported_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
 
-    reason = Column(String(100), nullable=False)
+    # Machine-readable category enum (see schemas.ReportCategory) + where the
+    # report was filed (schemas.ReportContext). Replaces the legacy free-text
+    # `reason` string per REPORTING_CATEGORIES_SPEC.md. Stored as String + DB
+    # CHECK (defense-in-depth alongside the Pydantic enum); the `reason` column
+    # is dropped in follow-up migration B.
+    category = Column(String(40), nullable=False, index=True)
+    context = Column(String(20), nullable=False, default="chat")
     details = Column(Text, nullable=True)
 
     # "pending" | "reviewed" | "dismissed"
@@ -362,6 +368,17 @@ class Report(Base):
 
     __table_args__ = (
         CheckConstraint("status IN ('pending', 'reviewed', 'dismissed')", name='valid_report_status'),
+        CheckConstraint(
+            "category IN ('harassment', 'inappropriate_photos', 'explicit_on_video_call', "
+            "'underage', 'impersonation', 'scam_spam', 'hate_speech', "
+            "'violence_threat', 'off_platform_solicitation', 'other')",
+            name='reports_category_valid'
+        ),
+        CheckConstraint(
+            "context IN ('chat', 'video_call', 'profile')",
+            name='reports_context_valid'
+        ),
+        Index('ix_reports_status_category', 'status', 'category'),
     )
 
 
