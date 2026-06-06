@@ -158,16 +158,18 @@ async def get_my_calls(
         if call.user1_id == user.id:
             other_user_name = user2.name if user2 else "Unknown User"
             other_user_id = call.user2_id
+            other_user_firebase_uid = user2.firebase_uid if user2 else None
         else:
             other_user_name = user1.name if user1 else "Unknown User"
             other_user_id = call.user1_id
-        
+            other_user_firebase_uid = user1.firebase_uid if user1 else None
+
         # Format datetime for iOS
         start_time_str = call.scheduled_start_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
         end_time_str = call.scheduled_end_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
         created_str = call.created_at.strftime('%Y-%m-%dT%H:%M:%SZ')
         updated_str = call.updated_at.strftime('%Y-%m-%dT%H:%M:%SZ')
-        
+
         # Create response object with populated names
         call_response = ScheduledCallResponse(
             id=call.id,
@@ -179,6 +181,7 @@ async def get_my_calls(
             user2_name=user2.name if user2 else None,
             other_user_name=other_user_name,
             other_user_id=other_user_id,
+            other_user_firebase_uid=other_user_firebase_uid,
             start_time_utc=start_time_str,  # iOS expects string
             end_time_utc=end_time_str,      # iOS expects string
             scheduled_start_utc=call.scheduled_start_utc,
@@ -387,6 +390,7 @@ async def schedule_call(
             user2_name=user2.name if user2 else None,
             other_user_name=other_user_name,
             other_user_id=other_user_id,
+            other_user_firebase_uid=other_user.firebase_uid if other_user else None,
             start_time_utc=start_time_str,
             end_time_utc=end_time_str,
             scheduled_start_utc=new_call.scheduled_start_utc,

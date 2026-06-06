@@ -469,6 +469,9 @@ class ScheduledCallResponse(BaseModel):
     # Indicate which user is the "other" user from current user's perspective
     other_user_name: Optional[str] = None
     other_user_id: Optional[int] = None
+    # Firebase UID of the other user — lets call-context surfaces (e.g. in-call
+    # report/block) identify the user the same way every other surface does.
+    other_user_firebase_uid: Optional[str] = None
     start_time_utc: str  # iOS expects string format
     end_time_utc: str    # iOS expects string format
     scheduled_start_utc: datetime
