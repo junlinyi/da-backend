@@ -1601,21 +1601,25 @@ NO_SHOW_GRACE_MIN = 10
 @router.post("/calls/{call_id}/no-show", response_model=dict)
 async def mark_call_no_show(
     call_id: int,
-    body: Optional[dict] = None,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Mark a scheduled call as no-show (called by the detect_no_shows cron, not
-    user-facing). Logs one NoShowEvent per non-joiner, bumps users.no_show_count,
-    and applies the 2-strikes-same-match termination.
+    """Mark a scheduled call as no-show. Logs one NoShowEvent per non-joiner,
+    bumps users.no_show_count, and applies the 2-strikes-same-match termination.
 
-    Optional body `{ no_show_user_id: int }` forces a specific user as the
-    no-shower (per spec); otherwise non-joiners are derived from the join flags.
+    Authorization: the caller MUST be a participant of the call's match. The set
+    of no-showers is derived ONLY from the authoritative join flags
+    (user1_joined / user2_joined) — there is no caller-supplied override, so a
+    participant cannot frame the other party or stamp a no-show on a stranger.
     """
     result = await db.execute(select(ScheduledCall).where(ScheduledCall.id == call_id))
     call = result.scalar_one_or_none()
     if call is None:
         raise HTTPException(status_code=404, detail="Scheduled call not found")
+
+    # Participant check — only the two users on this call's match may act on it.
+    if user.id not in (call.user1_id, call.user2_id):
+        raise HTTPException(status_code=403, detail="Not a participant of this call")
 
     grace_deadline = call.scheduled_start_utc + timedelta(minutes=NO_SHOW_GRACE_MIN)
     if mss.utc_now() < grace_deadline:
@@ -1624,15 +1628,19 @@ async def mark_call_no_show(
     if call.status != "scheduled":
         raise HTTPException(status_code=409, detail=f"call already {call.status}")
 
-    forced_uid = (body or {}).get("no_show_user_id")
-    if forced_uid is not None:
-        non_joiner_ids = [forced_uid]
-    else:
-        non_joiner_ids = []
-        if not call.user1_joined:
-            non_joiner_ids.append(call.user1_id)
-        if not call.user2_joined:
-            non_joiner_ids.append(call.user2_id)
+    # Non-joiners derived solely from the authoritative join flags.
+    non_joiner_ids = [
+        uid
+        for uid, joined in (
+            (call.user1_id, call.user1_joined),
+            (call.user2_id, call.user2_joined),
+        )
+        if not joined
+    ]
+
+    # Both participants joined -> no no-show occurred; do not fabricate one.
+    if not non_joiner_ids:
+        return {"no_show_count": 0, "match_terminated": False}
 
     res = await mss.record_no_show(db, call, non_joiner_ids)
     await db.commit()

@@ -156,18 +156,58 @@ async def test_no_show_call_not_found_404(make_user, client_as):
 
 
 @pytest.mark.asyncio
-async def test_no_show_forced_user_id(make_user, make_match, client_as, db):
+async def test_no_show_non_participant_403(make_user, make_match, client_as, db):
+    """A user who is not on the call's match cannot trigger a no-show, and no
+    state is mutated for the would-be victim."""
+    a = await make_user(name="Al"); b = await make_user(name="Bo")
+    stranger = await make_user(name="Eve")
+    m = await make_match(a, b)
+    call = await _make_past_call(db, m, a, b, user1_joined=False, user2_joined=False)
+    async with client_as(stranger) as c:
+        r = await c.post(f"/scheduling/calls/{call.id}/no-show")
+    assert r.status_code == 403, r.text
+    await db.refresh(call); await db.refresh(a); await db.refresh(b)
+    assert call.status == "scheduled"
+    assert await _no_show_event_count(db, m.id) == 0
+    assert a.no_show_count == 0 and b.no_show_count == 0
+
+
+@pytest.mark.asyncio
+async def test_no_show_ignores_joined_user(make_user, make_match, client_as, db):
+    """Non-joiners are derived only from the authoritative join flags — a user
+    who actually joined never gets a no-show, even if the caller tries to force
+    it via a (now-ignored) body override."""
     a = await make_user(name="Al"); b = await make_user(name="Bo")
     m = await make_match(a, b)
-    # Both flags False, but force only b.
-    call = await _make_past_call(db, m, a, b, user1_joined=False, user2_joined=False)
+    # a (user1) joined; b (user2) did not.
+    call = await _make_past_call(db, m, a, b, user1_joined=True, user2_joined=False)
     async with client_as(a) as c:
-        r = await c.post(f"/scheduling/calls/{call.id}/no-show", json={"no_show_user_id": b.id})
+        # attempt to frame the joined user (a) via the legacy override — must be ignored
+        r = await c.post(f"/scheduling/calls/{call.id}/no-show", json={"no_show_user_id": a.id})
     assert r.status_code == 200, r.text
     assert r.json()["no_show_count"] == 1
-    await db.refresh(b); await db.refresh(a)
-    assert b.no_show_count == 1
+    await db.refresh(a); await db.refresh(b)
+    # only the actually-non-joined user (b) is penalized; the joined user (a) is untouched
+    assert await _no_show_event_count(db, m.id, a.id) == 0
     assert a.no_show_count == 0
+    assert await _no_show_event_count(db, m.id, b.id) == 1
+    assert b.no_show_count == 1
+
+
+@pytest.mark.asyncio
+async def test_no_show_both_joined_no_event(make_user, make_match, client_as, db):
+    """If both participants joined, no no-show is fabricated."""
+    a = await make_user(name="Al"); b = await make_user(name="Bo")
+    m = await make_match(a, b)
+    call = await _make_past_call(db, m, a, b, user1_joined=True, user2_joined=True)
+    async with client_as(a) as c:
+        r = await c.post(f"/scheduling/calls/{call.id}/no-show")
+    assert r.status_code == 200, r.text
+    assert r.json() == {"no_show_count": 0, "match_terminated": False}
+    await db.refresh(call); await db.refresh(m)
+    assert call.status == "scheduled"          # unchanged
+    assert m.call_status != "no_show"
+    assert await _no_show_event_count(db, m.id) == 0
 
 
 # ---------------------------------------------------------------------------
