@@ -3,7 +3,7 @@ dimensions (text_state, call_status, lifecycle) and the card-display helper."""
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import models
@@ -121,6 +121,56 @@ async def transition_text_state(db: AsyncSession, match_id: int, new_state: str)
         m.text_unlocked_at = utc_now()
     await db.flush()
     return m
+
+
+async def record_no_show(db: AsyncSession, call: "models.ScheduledCall", no_show_user_ids) -> dict:
+    """Mark a scheduled call as no_show, log one NoShowEvent per non-joiner, bump
+    users.no_show_count, and apply the 2-strikes-same-match termination.
+
+    Returns dict(no_show_count_logged, match_terminated).
+    """
+    now = utc_now()
+    no_show_user_ids = list(no_show_user_ids)
+    call.status = "no_show"
+    m = await _lock_match(db, call.match_id)
+    m.call_status = "no_show"
+
+    for uid in no_show_user_ids:
+        db.add(models.NoShowEvent(
+            user_id=uid,
+            match_id=call.match_id,
+            scheduled_call_id=call.id,
+            event_type="no_show",
+        ))
+        u = (await db.execute(
+            select(models.User).where(models.User.id == uid)
+        )).scalar_one()
+        u.no_show_count = (u.no_show_count or 0) + 1
+        u.last_no_show_at = now
+
+    # Flush so the freshly-inserted events are visible to the count query below.
+    await db.flush()
+
+    # 2-strikes termination: does ANY single user have >= 2 no-show events on
+    # THIS match? Count events grouped by user for this match_id.
+    max_events = (await db.execute(
+        select(func.count(models.NoShowEvent.id))
+        .where(models.NoShowEvent.match_id == call.match_id)
+        .group_by(models.NoShowEvent.user_id)
+        .order_by(func.count(models.NoShowEvent.id).desc())
+        .limit(1)
+    )).scalar()
+
+    match_terminated = bool(max_events and max_events >= 2)
+    if match_terminated:
+        m.lifecycle = "terminated"
+        m.text_state = "archived"
+
+    await db.flush()
+    return {
+        "no_show_count_logged": len(no_show_user_ids),
+        "match_terminated": match_terminated,
+    }
 
 
 async def process_exit_survey(db: AsyncSession, match_id: int, user_id: int, response: bool) -> models.Match:

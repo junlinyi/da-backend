@@ -200,6 +200,10 @@ class ScheduledCall(Base):
     user2_confirmed = Column(Boolean, default=False)
     user1_confirmed_at = Column(DateTime(timezone=True), nullable=True)
     user2_confirmed_at = Column(DateTime(timezone=True), nullable=True)
+
+    # Join signals (set when a user actually joins the call) — drive no-show detection
+    user1_joined = Column(Boolean, default=False, nullable=False)
+    user2_joined = Column(Boolean, default=False, nullable=False)
     
     # Call metadata
     call_room_id = Column(String(255), nullable=True)  # Twilio room ID or similar
