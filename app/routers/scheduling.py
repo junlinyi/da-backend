@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from typing import List, Optional
 from datetime import datetime, time, timedelta, timezone
 from app.database import get_db
@@ -479,7 +480,31 @@ async def propose_call(
             f"{proposer_name} proposed a video date for {when}. {peer_name}, review the proposal.",
         )
 
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        # Defense-in-depth: the partial unique index (one pending proposal per
+        # match) fired despite the row lock + existence check. Return the same
+        # clean 409 + active-proposal payload Flow 6 expects, not a raw 500.
+        await db.rollback()
+        active = (
+            await db.execute(
+                select(VideoCallProposal).where(
+                    VideoCallProposal.match_id == m.id,
+                    VideoCallProposal.status == "pending",
+                )
+            )
+        ).scalar_one_or_none()
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "A proposal is already pending",
+                "active_proposal": (
+                    VideoCallProposalResponse.model_validate(active).model_dump(mode="json")
+                    if active is not None else None
+                ),
+            },
+        )
     await db.refresh(proposal)
 
     peer_id = m.matched_user_id if m.user_id == user.id else m.user_id
@@ -596,8 +621,10 @@ async def accept_proposal(
 
     await db.commit()
     await db.refresh(call)
-    await db.refresh(user1)
-    await db.refresh(user2)
+    if user1 is not None:
+        await db.refresh(user1)
+    if user2 is not None:
+        await db.refresh(user2)
 
     await _notify_peer_best_effort(
         db, proposal.proposer_user_id, user, "accepted", m.id,
