@@ -77,6 +77,10 @@ class User(Base):
     values_profile = relationship("UserValues", back_populates="user", uselist=False, cascade="all, delete-orphan")
     feature_vector = relationship("UserFeatureVector", back_populates="user", uselist=False, cascade="all, delete-orphan")
 
+    __table_args__ = (
+        Index("idx_users_no_show_count", "no_show_count", postgresql_where=text("no_show_count > 0")),
+    )
+
 
 class Match(Base):
     __tablename__ = "matches"
@@ -121,6 +125,14 @@ class Match(Base):
     # Unique constraint to prevent duplicate matches
     __table_args__ = (
         UniqueConstraint('user_id', 'matched_user_id', name='uq_user_matched_user'),
+        CheckConstraint("text_state IN ('open','locked','archived')", name="chk_text_state"),
+        CheckConstraint("call_status IN ('none','proposal_pending','scheduled','in_progress','pending_survey','completed','no_show')", name="chk_call_status"),
+        CheckConstraint("lifecycle IN ('active','terminated','expired')", name="chk_lifecycle"),
+        Index("idx_matches_text_state", "text_state"),
+        Index("idx_matches_call_status", "call_status"),
+        Index("idx_matches_lifecycle", "lifecycle"),
+        Index("idx_matches_text_locked_at", "text_locked_at", postgresql_where=text("text_locked_at IS NOT NULL")),
+        Index("idx_matches_active_needs_action", "lifecycle", "text_state", "call_status", postgresql_where=text("lifecycle = 'active'")),
     )
 
 
@@ -293,6 +305,8 @@ class VideoCallProposal(Base):
         Index("idx_one_pending_proposal_per_match", "match_id",
               unique=True, postgresql_where=text("status = 'pending'")),
         Index("idx_video_call_proposals_match", "match_id"),
+        Index("idx_video_call_proposals_proposer", "proposer_user_id"),
+        Index("idx_video_call_proposals_status", "status"),
     )
 
 
@@ -308,6 +322,9 @@ class NoShowEvent(Base):
     __table_args__ = (
         CheckConstraint("event_type IN ('no_show','partial')", name="chk_nse_type"),
         Index("idx_no_show_events_user_match", "user_id", "match_id"),
+        Index("idx_no_show_events_user", "user_id", text("detected_at DESC")),
+        Index("idx_no_show_events_match", "match_id"),
+        Index("idx_no_show_events_call", "scheduled_call_id"),
     )
 
 
