@@ -1,12 +1,15 @@
 """Scheduling V2 match-state machine. Owns transitions of the three orthogonal
 dimensions (text_state, call_status, lifecycle) and the card-display helper."""
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import models
+
+logger = logging.getLogger(__name__)
 
 
 def utc_now() -> datetime:
@@ -171,6 +174,89 @@ async def record_no_show(db: AsyncSession, call: "models.ScheduledCall", no_show
         "no_show_count_logged": len(no_show_user_ids),
         "match_terminated": match_terminated,
     }
+
+
+async def _resolve_conversation_for_match(db: AsyncSession, match: "models.Match"):
+    """Find the Postgres Conversation between the match's two users (either order)."""
+    a, b = match.user_id, match.matched_user_id
+    return (await db.execute(
+        select(models.Conversation).where(
+            or_(
+                (models.Conversation.user1_id == a) & (models.Conversation.user2_id == b),
+                (models.Conversation.user1_id == b) & (models.Conversation.user2_id == a),
+            )
+        )
+    )).scalar_one_or_none()
+
+
+async def write_system_message(db: AsyncSession, match: "models.Match",
+                               system_message_type: str, text: str) -> None:
+    """Write a system message: a Firestore doc (messageType='system') for
+    real-time render, plus a Postgres Message mirror row (sender_id=NULL) for
+    analytics.
+
+    The Postgres mirror is part of the caller's session (added but not committed
+    here — the caller's commit persists it). The Firestore write is best-effort:
+    a Firestore failure (or Firestore being unavailable in tests) is swallowed so
+    it never breaks the caller's transaction.
+    """
+    # 1) Postgres mirror row (sender_id=NULL marks a system message).
+    conversation = await _resolve_conversation_for_match(db, match)
+    if conversation is not None:
+        db.add(models.Message(
+            conversation_id=conversation.id,
+            sender_id=None,
+            content=text,
+            message_type="system",
+            system_message_type=system_message_type,
+        ))
+    else:
+        logger.info(
+            "write_system_message: no Conversation for match %s; skipping PG mirror",
+            getattr(match, "id", "?"),
+        )
+
+    # 2) Firestore doc — best-effort, reusing messaging.py's path/pattern.
+    try:
+        from firebase_admin import firestore
+
+        a, b = match.user_id, match.matched_user_id
+        user_a = (await db.execute(
+            select(models.User).where(models.User.id == a)
+        )).scalar_one_or_none()
+        user_b = (await db.execute(
+            select(models.User).where(models.User.id == b)
+        )).scalar_one_or_none()
+        if not (user_a and user_b and user_a.firebase_uid and user_b.firebase_uid):
+            return
+
+        firestore_db = firestore.client()
+        conversations_ref = firestore_db.collection("conversations")
+        conversation_id = None
+        for doc in conversations_ref.where(
+            "participants", "array_contains", user_a.firebase_uid
+        ).stream():
+            data = doc.to_dict()
+            if user_b.firebase_uid in data.get("participants", []):
+                conversation_id = doc.id
+                break
+        if conversation_id is None:
+            return
+
+        conv_ref = conversations_ref.document(conversation_id)
+        conv_ref.collection("messages").add({
+            "senderId": None,
+            "content": text,
+            "messageType": "system",
+            "systemMessageType": system_message_type,
+            "timestamp": firestore.SERVER_TIMESTAMP,
+        })
+        conv_ref.update({
+            "lastMessage": text,
+            "lastMessageTime": firestore.SERVER_TIMESTAMP,
+        })
+    except Exception as exc:  # noqa: BLE001 — best-effort mirror
+        logger.warning("write_system_message: Firestore write failed: %s", exc)
 
 
 async def process_exit_survey(db: AsyncSession, match_id: int, user_id: int, response: bool) -> models.Match:

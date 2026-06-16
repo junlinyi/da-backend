@@ -593,6 +593,19 @@ async def propose_call(
     if mss.is_legal_call_status(m.call_status, "proposal_pending"):
         m.call_status = "proposal_pending"
 
+    # System message (only when text is OPEN — spec Flow 2 step 5: no in-chat
+    # system message when text is locked). Added to this session before commit.
+    if m.text_state == "open":
+        peer_id_for_msg = m.matched_user_id if m.user_id == user.id else m.user_id
+        peer = (await db.execute(select(User).where(User.id == peer_id_for_msg))).scalar_one_or_none()
+        proposer_name = user.name or "Your match"
+        peer_name = (peer.name if peer else None) or "your match"
+        when = start.strftime("%a %-I %p")
+        await mss.write_system_message(
+            db, m, "proposal_created",
+            f"{proposer_name} proposed a video date for {when}. {peer_name}, review the proposal.",
+        )
+
     await db.commit()
     await db.refresh(proposal)
 
@@ -702,6 +715,11 @@ async def accept_proposal(
     if user2 is not None:
         user2.total_calls_scheduled = (user2.total_calls_scheduled or 0) + 1
 
+    when = call.scheduled_start_utc.strftime("%a %-I %p")
+    await mss.write_system_message(
+        db, m, "call_scheduled", f"Video date scheduled for {when}.",
+    )
+
     await db.commit()
     await db.refresh(call)
     await db.refresh(user1)
@@ -761,6 +779,13 @@ async def counter_proposal(
 
     if mss.is_legal_call_status(m.call_status, "proposal_pending"):
         m.call_status = "proposal_pending"
+
+    counter_name = user.name or "Your match"
+    when = start.strftime("%a %-I %p")
+    await mss.write_system_message(
+        db, m, "proposal_countered",
+        f"{counter_name} suggested a new video date time: {when}.",
+    )
 
     await db.commit()
     await db.refresh(new_proposal)

@@ -7,6 +7,7 @@ from sqlalchemy import or_
 from app.schemas import MessageCreate, MessageResponse, ConversationResponse
 from app.dependencies import verify_firebase_token
 from app.services import push_notification_service as push
+from app.services.chat_message_filter import filter_message_content
 from typing import List
 from datetime import datetime, timezone
 import json
@@ -17,6 +18,38 @@ from firebase_admin import firestore
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def assert_text_open(match):
+    """Scheduling V2 chat gate. Raise 403 if the match's text window is not open.
+
+    None policy: a missing Match record means we cannot resolve V2 state for this
+    conversation (e.g. a legacy conversation with no corresponding Match, or a
+    pre-V2 seeded chat). We DO NOT block in that case — the gate only applies to
+    real V2 matches. Every V2 match has a Match row with text_state defaulting to
+    'open', so this only ever lets through edge/legacy conversations.
+    """
+    if match is None:
+        return
+    if match.text_state != "open":
+        raise HTTPException(
+            status_code=403,
+            detail="Text is locked — schedule a video date to keep talking",
+        )
+
+
+async def _resolve_match_for_pair(db: AsyncSession, user_a_id: int, user_b_id: int):
+    """Resolve the Match between two backend user ids (either ordering)."""
+    match_q = await db.execute(
+        select(Match).where(
+            or_(
+                (Match.user_id == user_a_id) & (Match.matched_user_id == user_b_id),
+                (Match.user_id == user_b_id) & (Match.matched_user_id == user_a_id),
+            )
+        )
+    )
+    return match_q.scalar_one_or_none()
+
 
 @router.get("/conversations/test")
 async def test_conversations_format():
@@ -262,30 +295,51 @@ async def send_message(
         
         if current_user_firebase_uid not in participants:
             raise HTTPException(status_code=403, detail="Not a participant in this conversation")
-        
-        # Create message in Firebase
+
+        # --- Scheduling V2 gate: resolve the Match for this pair and enforce the
+        # text-lock BEFORE any write. The other participant's firebase_uid -> User
+        # -> Match between the two backend user ids. ---
+        other_uid = next((uid for uid in participants if uid != current_user_firebase_uid), None)
+        v2_match = None
+        if other_uid:
+            other_user_q = await db.execute(select(User).where(User.firebase_uid == other_uid))
+            other_user_for_match = other_user_q.scalar_one_or_none()
+            if other_user_for_match:
+                v2_match = await _resolve_match_for_pair(db, current_user.id, other_user_for_match.id)
+
+        assert_text_open(v2_match)  # raises 403 if text_state != 'open'
+
+        # Apply phone-number masking. Skip masking only once contact reveal is
+        # unlocked (post-call mutual-yes), per spec Flow 8 step 5.
+        if v2_match is not None and getattr(v2_match, "contact_reveal_unlocked", False):
+            outgoing_content, masked = message.content, False
+        else:
+            outgoing_content, masked = filter_message_content(message.content)
+
+        # Create message in Firebase (write the MASKED content to both sides)
         message_data = {
-            'content': message.content,
+            'content': outgoing_content,
             'senderId': current_user_firebase_uid,
             'timestamp': firestore.SERVER_TIMESTAMP,
             'messageType': message.message_type or 'text'
         }
-        
+
         message_ref = conversation_ref.collection('messages').add(message_data)
-        
+
         # Update conversation with last message
         conversation_ref.update({
-            'lastMessage': message.content,
+            'lastMessage': outgoing_content,
             'lastMessageTime': firestore.SERVER_TIMESTAMP
         })
-        
-        # Also create message in PostgreSQL for analytics
+
+        # Also create message in PostgreSQL for analytics (masked content + flag)
         await create_message_in_postgresql(
             conversation_id,
             current_user.id,
-            message.content,
+            outgoing_content,
             message.message_type or 'text',
-            db
+            db,
+            has_masked_content=masked,
         )
 
         # D2 — notify the recipient of the new message (best-effort, fire-and-forget)
@@ -343,10 +397,15 @@ async def send_message(
         return {
             "success": True,
             "message_id": message_ref[1].id,
-            "content": message.content,
+            "content": outgoing_content,
+            "has_masked_content": masked,
             "timestamp": datetime.now(timezone.utc)
         }
-        
+
+    except HTTPException:
+        # Preserve intentional status codes (403 text-locked / not-participant,
+        # 404 conversation not found) instead of masking them as 500.
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error sending message: {str(e)}")
 
@@ -368,22 +427,28 @@ async def mark_messages_as_read_firebase(conversation_id: str, user_firebase_uid
         pass
 
 async def create_message_in_postgresql(
-    conversation_id: str, 
-    sender_id: int, 
-    content: str, 
+    conversation_id: str,
+    sender_id: int,
+    content: str,
     message_type: str,
-    db: AsyncSession
+    db: AsyncSession,
+    has_masked_content: bool = False,
 ):
     """
     Create message in PostgreSQL for analytics purposes
     """
     try:
+        # The incoming id is a Firestore doc id (string). Conversation.id is an
+        # int PK, so only attempt the lookup when the id is numeric — otherwise a
+        # non-int comparison would abort the transaction (and never match anyway).
+        if not str(conversation_id).isdigit():
+            return
         # Find the PostgreSQL conversation ID
         result = await db.execute(
-            select(Conversation).where(Conversation.id == conversation_id)
+            select(Conversation).where(Conversation.id == int(conversation_id))
         )
         pg_conversation = result.scalar_one_or_none()
-        
+
         if pg_conversation:
             # Create message in PostgreSQL
             new_message = Message(
@@ -392,11 +457,12 @@ async def create_message_in_postgresql(
                 content=content,
                 message_type=message_type,
                 timestamp=datetime.now(timezone.utc),
+                has_masked_content=has_masked_content,
                 firebase_id=conversation_id  # Store Firebase conversation ID for reference
             )
             db.add(new_message)
             await db.commit()
-            
+
     except Exception as e:
         # Error creating message in PostgreSQL
         # Don't fail the main operation if PostgreSQL sync fails
