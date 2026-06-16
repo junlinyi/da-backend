@@ -16,6 +16,7 @@ from app.models import (
 # ProposalResponse, CounterProposalTimeSlot, CallRequest) were removed in Task 1.1.
 # The endpoints below that still reference them are dead and will be deleted in Task 9.1;
 # they only NameError if invoked, not at import.
+from app import schemas
 from app.schemas import (
     UserSchedulingPreferenceCreate, UserSchedulingPreferenceResponse,
     ScheduledCallCreate, ScheduledCallResponse,
@@ -213,84 +214,148 @@ async def get_my_calls(
     
     return calls
 
-@router.get("/me/matches", response_model=List[dict])
-async def get_my_matches_without_calls(
+@router.get("/me/matches", response_model=List[schemas.MatchListItem])
+async def get_my_matches(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Get user's unscheduled matches within the 48-hour scheduling window.
+    """Scheduling V2 — return the viewer's ACTIVE matches with the full state
+    triplet (text_state / call_status / lifecycle), a precomputed card_display
+    string, the active proposal (if any), the current scheduled call (if any),
+    and exit-survey responses.
 
-    Returns only matches where:
-    - No scheduled call exists yet
-    - No pending proposal exists yet (those appear in /proposals)
-    - Match was created within the last 48 hours (Tier 2 window)
-
-    Each result includes `initiator_id` (the user who swiped / User A).
+    Spec: DatingAppProj/SCHEDULING_V2.md §Endpoints (me/matches) +
+    §valid-combinations (card_display) + §Transition rules (proposer-waiting copy).
     """
-    from datetime import datetime, timezone, timedelta
+    matches = (
+        await db.execute(
+            select(Match).where(
+                ((Match.user_id == user.id) | (Match.matched_user_id == user.id))
+                & (Match.lifecycle == "active")
+            )
+        )
+    ).scalars().all()
 
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
+    now = mss.utc_now()
+    items: List[schemas.MatchListItem] = []
 
-    # Matches within the 48h window, excluding expired/blocked
-    matches_query = select(Match).where(
-        ((Match.user_id == user.id) | (Match.matched_user_id == user.id))
-        & (Match.created_at >= cutoff)
-        & (~Match.status.in_(["expired", "blocked", "rejected"]))
-    )
-    matches_result = await db.execute(matches_query)
-    matches = matches_result.scalars().all()
-
-    # Match IDs that already have scheduled calls (any status)
-    calls_query = select(ScheduledCall.match_id).where(
-        (ScheduledCall.user1_id == user.id) | (ScheduledCall.user2_id == user.id)
-    )
-    calls_result = await db.execute(calls_query)
-    scheduled_match_ids = {row[0] for row in calls_result.fetchall()}
-
-    # Match IDs that already have a pending proposal
-    from app.models import SchedulingProposal as ProposalModel
-    proposals_query = select(ProposalModel.match_id).where(
-        ((ProposalModel.proposer_id == user.id) | (ProposalModel.receiver_id == user.id))
-        & (ProposalModel.status == "pending")
-    )
-    proposals_result = await db.execute(proposals_query)
-    proposed_match_ids = {row[0] for row in proposals_result.fetchall()}
-
-    exclude_ids = scheduled_match_ids | proposed_match_ids
-
-    unscheduled_matches = []
     for match in matches:
-        if match.id in exclude_ids:
-            continue
+        peer_id = match.matched_user_id if match.user_id == user.id else match.user_id
+        peer = (await db.execute(select(User).where(User.id == peer_id))).scalar_one_or_none()
 
-        if match.user_id == user.id:
-            other_user_id = match.matched_user_id
-        else:
-            other_user_id = match.user_id
+        # Latest pending proposal (if any)
+        active_proposal = (
+            await db.execute(
+                select(VideoCallProposal)
+                .where(
+                    VideoCallProposal.match_id == match.id,
+                    VideoCallProposal.status == "pending",
+                )
+                .order_by(VideoCallProposal.id.desc())
+            )
+        ).scalars().first()
 
-        other_user_query = await db.execute(select(User).where(User.id == other_user_id))
-        other_user = other_user_query.scalar_one_or_none()
+        # Current scheduled call (scheduled | in_progress), latest first
+        call = (
+            await db.execute(
+                select(ScheduledCall)
+                .where(
+                    ScheduledCall.match_id == match.id,
+                    ScheduledCall.status.in_(("scheduled", "in_progress")),
+                )
+                .order_by(ScheduledCall.id.desc())
+            )
+        ).scalars().first()
 
-        # Deadline for scheduling (48h from match creation)
-        deadline = None
-        if match.created_at:
-            dt = match.created_at
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            deadline = (dt + timedelta(hours=48)).isoformat()
+        scheduled_call_resp = None
+        scheduled_start = None
+        if call is not None:
+            scheduled_start = call.scheduled_start_utc
+            user1 = (await db.execute(select(User).where(User.id == call.user1_id))).scalar_one_or_none()
+            user2 = (await db.execute(select(User).where(User.id == call.user2_id))).scalar_one_or_none()
+            scheduled_call_resp = _build_scheduled_call_response(call, user, user1, user2)
 
-        unscheduled_matches.append({
-            "id": match.id,
-            "user1_id": match.user_id,           # initiator (swiped right)
-            "user2_id": match.matched_user_id,   # recipient
-            "initiator_id": match.user_id,        # explicit field: User A
-            "other_user_id": other_user_id,
-            "other_user_name": other_user.name if other_user else "Unknown User",
-            "created_at": match.created_at.isoformat() if match.created_at else None,
-            "scheduling_deadline": deadline,
-        })
+        # hours_left for the card copy
+        hours_left = None
+        if match.text_state == "open" and match.created_at is not None:
+            created = match.created_at
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            hours_left = max(0, int((created + timedelta(hours=mss.TEXT_WINDOW_HOURS) - now).total_seconds() // 3600))
+        elif match.expires_at is not None:
+            exp = match.expires_at
+            if exp.tzinfo is None:
+                exp = exp.replace(tzinfo=timezone.utc)
+            hours_left = max(0, int((exp - now).total_seconds() // 3600))
 
-    return unscheduled_matches
+        is_proposer = active_proposal is not None and active_proposal.proposer_user_id == user.id
+
+        card_display = mss.compute_match_card_display(
+            match.text_state, match.call_status, match.lifecycle,
+            hours_left=hours_left, scheduled_start=scheduled_start, is_proposer=is_proposer,
+        )
+        # Spec §Transition rules: name the peer in the proposer-waiting card. The
+        # pure fn lacks the name, so substitute here.
+        if is_proposer and match.call_status == "proposal_pending":
+            card_display = f"Waiting for {(peer.name if peer else None) or 'them'} to confirm"
+
+        is_a = mss._is_user_a(match, user.id)
+        self_response = match.exit_survey_user_a_response if is_a else match.exit_survey_user_b_response
+        peer_response = match.exit_survey_user_b_response if is_a else match.exit_survey_user_a_response
+
+        items.append(schemas.MatchListItem(
+            match_id=match.id,
+            peer_user=schemas.PeerUserSummary(
+                id=peer.id if peer else peer_id,
+                name=peer.name if peer else None,
+                timezone=peer.timezone if peer else None,
+                no_show_count=(peer.no_show_count or 0) if peer else 0,
+            ),
+            text_state=match.text_state,
+            call_status=match.call_status,
+            lifecycle=match.lifecycle,
+            text_locked_at=match.text_locked_at,
+            expires_at=match.expires_at,
+            card_display=card_display,
+            active_proposal=(
+                schemas.VideoCallProposalResponse.model_validate(active_proposal)
+                if active_proposal is not None else None
+            ),
+            scheduled_call=scheduled_call_resp,
+            exit_survey_self_response=self_response,
+            exit_survey_peer_response=peer_response,
+            contact_reveal_unlocked=bool(match.contact_reveal_unlocked),
+        ))
+
+    return items
+
+
+@router.get("/me/upcoming-calls", response_model=List[schemas.ScheduledCallResponse])
+async def get_my_upcoming_calls(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Scheduling V2 — the viewer's upcoming (future, status='scheduled') calls,
+    earliest first. Spec: DatingAppProj/SCHEDULING_V2.md §Endpoints (me/upcoming-calls)."""
+    now = mss.utc_now()
+    calls = (
+        await db.execute(
+            select(ScheduledCall)
+            .where(
+                ((ScheduledCall.user1_id == user.id) | (ScheduledCall.user2_id == user.id))
+                & (ScheduledCall.status == "scheduled")
+                & (ScheduledCall.scheduled_start_utc > now)
+            )
+            .order_by(ScheduledCall.scheduled_start_utc.asc())
+        )
+    ).scalars().all()
+
+    out: List[schemas.ScheduledCallResponse] = []
+    for call in calls:
+        user1 = (await db.execute(select(User).where(User.id == call.user1_id))).scalar_one_or_none()
+        user2 = (await db.execute(select(User).where(User.id == call.user2_id))).scalar_one_or_none()
+        out.append(_build_scheduled_call_response(call, user, user1, user2))
+    return out
 
 @router.post("/calls", response_model=ScheduledCallResponse)
 async def schedule_call(

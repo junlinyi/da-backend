@@ -9,6 +9,7 @@ import pytest
 from datetime import timedelta
 
 from app.services.match_state_service import utc_now
+from app.services.match_state_service import utc_now as mss_utc
 
 
 # ---------------------------------------------------------------------------
@@ -140,3 +141,98 @@ async def test_proposer_cannot_counter_own_403(make_user, make_match, client_as)
         pid = (await c.post("/scheduling/calls/propose", json={"match_id": m.id, "proposed_start_utc": s1})).json()["id"]
         r = await c.post(f"/scheduling/calls/{pid}/counter", json={"proposed_start_utc": s2})
     assert r.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# Task 4.4 — GET /scheduling/me/matches (V2 state)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_me_matches_basic(make_user, make_match, client_as, db):
+    a = await make_user(name="Alex", timezone="America/New_York")
+    b = await make_user(name="Mia", timezone="America/Los_Angeles")
+    m = await make_match(a, b)  # open/none/active
+    async with client_as(a) as c:
+        r = await c.get("/scheduling/me/matches")
+    assert r.status_code == 200, r.text
+    items = r.json(); assert len(items) == 1
+    it = items[0]
+    assert it["match_id"] == m.id
+    assert it["peer_user"]["id"] == b.id and it["peer_user"]["name"] == "Mia"
+    assert it["text_state"] == "open" and it["call_status"] == "none" and it["lifecycle"] == "active"
+    assert "Texting" in it["card_display"]
+    assert it["active_proposal"] is None and it["scheduled_call"] is None
+
+
+@pytest.mark.asyncio
+async def test_me_matches_concurrent_open_scheduled(make_user, make_match, client_as, db):
+    # open + scheduled concurrent state -> card shows Texting AND Video date
+    a = await make_user(name="A"); b = await make_user(name="B")
+    m = await make_match(a, b)
+    from datetime import timedelta
+    start = (mss_utc()) + timedelta(hours=5)
+    # set state directly + create a scheduled call
+    m.call_status = "scheduled"
+    from app import models as _m
+    db.add(_m.ScheduledCall(match_id=m.id, user1_id=a.id, user2_id=b.id,
+        scheduled_start_utc=start, scheduled_end_utc=start+timedelta(minutes=30),
+        duration_minutes=30, status="scheduled"))
+    await db.commit()
+    async with client_as(a) as c:
+        it = (await c.get("/scheduling/me/matches")).json()[0]
+    assert it["call_status"] == "scheduled"
+    assert "Texting" in it["card_display"] and "Video date" in it["card_display"]
+    assert it["scheduled_call"] is not None
+
+
+@pytest.mark.asyncio
+async def test_me_matches_proposal_pending_shows_active_proposal(make_user, make_match, client_as, db):
+    from datetime import timedelta
+    a = await make_user(name="A"); b = await make_user(name="B"); m = await make_match(a, b)
+    start = (mss_utc() + timedelta(hours=5)).isoformat()
+    async with client_as(a) as c:
+        await c.post("/scheduling/calls/propose", json={"match_id": m.id, "proposed_start_utc": start})
+    # proposer (A) sees waiting + active proposal; recipient (B) sees review
+    async with client_as(a) as c:
+        it_a = (await c.get("/scheduling/me/matches")).json()[0]
+    async with client_as(b) as c:
+        it_b = (await c.get("/scheduling/me/matches")).json()[0]
+    assert it_a["active_proposal"] is not None and it_a["active_proposal"]["status"] == "pending"
+    assert "Waiting" in it_a["card_display"]            # proposer waiting
+    assert "B".lower() in it_a["card_display"].lower() or "waiting for" in it_a["card_display"].lower()
+    assert "Review" in it_b["card_display"]             # recipient reviews
+
+
+@pytest.mark.asyncio
+async def test_me_matches_excludes_terminal(make_user, make_match, client_as, db):
+    a = await make_user(name="A"); b = await make_user(name="B")
+    m = await make_match(a, b); m.lifecycle = "expired"; m.text_state = "archived"
+    await db.commit()
+    async with client_as(a) as c:
+        items = (await c.get("/scheduling/me/matches")).json()
+    assert items == []
+
+
+# ---------------------------------------------------------------------------
+# Task 4.5 — GET /scheduling/me/upcoming-calls
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_upcoming_calls(make_user, make_match, client_as, db):
+    from datetime import timedelta
+    from app import models as _m
+    a = await make_user(name="A"); b = await make_user(name="B"); m = await make_match(a, b)
+    start = mss_utc() + timedelta(hours=5)
+    db.add(_m.ScheduledCall(match_id=m.id, user1_id=a.id, user2_id=b.id,
+        scheduled_start_utc=start, scheduled_end_utc=start+timedelta(minutes=30),
+        duration_minutes=30, status="scheduled"))
+    # a past one should be excluded
+    past = mss_utc() - timedelta(hours=5)
+    db.add(_m.ScheduledCall(match_id=m.id, user1_id=a.id, user2_id=b.id,
+        scheduled_start_utc=past, scheduled_end_utc=past+timedelta(minutes=30),
+        duration_minutes=30, status="scheduled"))
+    await db.commit()
+    async with client_as(a) as c:
+        r = await c.get("/scheduling/me/upcoming-calls")
+    assert r.status_code == 200, r.text
+    calls = r.json(); assert len(calls) == 1
