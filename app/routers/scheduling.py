@@ -10,7 +10,7 @@ from datetime import datetime, time, timedelta, timezone
 from app.database import get_db
 from app.models import (
     User, UserSchedulingPreferences, ScheduledCall, Match,
-    MatchOutcome
+    MatchOutcome, VideoCallProposal
 )
 # NOTE(v2): Legacy proposal/call-request models (SchedulingProposal, ProposalTimeSlot,
 # ProposalResponse, CounterProposalTimeSlot, CallRequest) were removed in Task 1.1.
@@ -19,7 +19,9 @@ from app.models import (
 from app.schemas import (
     UserSchedulingPreferenceCreate, UserSchedulingPreferenceResponse,
     ScheduledCallCreate, ScheduledCallResponse,
+    ProposeCallRequest, CounterProposalRequest, VideoCallProposalResponse,
 )
+from app.services import match_state_service as mss
 # TODO(v2): Legacy proposal/call-request schemas removed in Task 2.1. The proposal
 # and call-request endpoints below are dead and will be deleted in Task 9.1; their
 # response_model= decorators now use dict so the module still imports, and their
@@ -419,6 +421,289 @@ async def schedule_call(
     except Exception as e:
         logger.error(f"Exception in schedule_call: {e}", exc_info=True)
         raise
+
+# ============================================================================
+# SCHEDULING V2 — PROPOSAL LIFECYCLE (propose / accept / counter)
+# Spec: DatingAppProj/SCHEDULING_V2.md §Endpoints + §User Flows (Flow 1,3,6)
+# ============================================================================
+
+
+def _is_participant(match: Match, user_id: int) -> bool:
+    return match.user_id == user_id or match.matched_user_id == user_id
+
+
+def _parse_start_utc(raw: datetime) -> datetime:
+    """Normalize an incoming start time to tz-aware UTC and validate the window.
+
+    Raises HTTPException(400) if the time is in the past or beyond the 72h
+    proposal window. Pydantic already parsed the ISO string into a datetime.
+    """
+    start = raw
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    now = mss.utc_now()
+    if start <= now:
+        raise HTTPException(status_code=400, detail="proposed_start_utc must be in the future")
+    if start > now + timedelta(hours=mss.PROPOSAL_WINDOW_HOURS):
+        raise HTTPException(
+            status_code=400,
+            detail=f"proposed_start_utc must be within {mss.PROPOSAL_WINDOW_HOURS}h",
+        )
+    return start
+
+
+async def _notify_peer_best_effort(db: AsyncSession, peer_user_id: int, sender: User, kind: str, ref_id: int):
+    """Best-effort push to the peer. Can NEVER raise; swallows everything.
+
+    TODO(Task 7.1): replace with the V2 typed notify_* senders (built in Phase 7)
+    using the exact copy from the spec. For now we opportunistically call an
+    existing push_notification_service function if a reasonable one exists.
+    """
+    try:
+        peer = (await db.execute(select(User).where(User.id == peer_user_id))).scalar_one_or_none()
+        if peer is None:
+            return
+        if kind == "proposal" and hasattr(push, "notify_proposal_received"):
+            await push.notify_proposal_received(recipient=peer, proposer=sender, proposal_id=ref_id)
+        elif kind == "accepted" and hasattr(push, "notify_proposal_accepted"):
+            await push.notify_proposal_accepted(proposer=peer, accepter=sender, call_id=ref_id)
+        elif kind == "counter" and hasattr(push, "notify_counter_proposal_received"):
+            await push.notify_counter_proposal_received(recipient=peer, proposer=sender, proposal_id=ref_id)
+    except Exception as exc:  # pragma: no cover - best-effort, never break the endpoint
+        logger.warning(f"[PUSH] best-effort {kind} notify failed: {exc}")
+
+
+@router.post("/calls/propose", response_model=VideoCallProposalResponse)
+async def propose_call(
+    body: ProposeCallRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Flow 1 — a participant proposes a single video-date time (30 min slot).
+
+    Only one 'pending' proposal may exist per match (enforced by a partial unique
+    index). If one already exists, returns 409 with the active proposal so the
+    client can flip to a review UI (Flow 6).
+    """
+    start = _parse_start_utc(body.proposed_start_utc)
+    end = start + timedelta(minutes=mss.DATE_DURATION_MIN)
+
+    try:
+        m = await mss._lock_match(db, body.match_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Match not found")
+
+    if not _is_participant(m, user.id):
+        raise HTTPException(status_code=403, detail="You are not a participant in this match")
+
+    if m.lifecycle != "active" or m.text_state == "archived":
+        raise HTTPException(status_code=409, detail="This match is not schedulable")
+
+    existing = (
+        await db.execute(
+            select(VideoCallProposal).where(
+                VideoCallProposal.match_id == m.id,
+                VideoCallProposal.status == "pending",
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "A proposal is already pending",
+                "active_proposal": VideoCallProposalResponse.model_validate(existing).model_dump(mode="json"),
+            },
+        )
+
+    proposal = VideoCallProposal(
+        match_id=m.id,
+        proposer_user_id=user.id,
+        proposed_start_utc=start,
+        proposed_end_utc=end,
+        status="pending",
+    )
+    db.add(proposal)
+
+    if mss.is_legal_call_status(m.call_status, "proposal_pending"):
+        m.call_status = "proposal_pending"
+
+    await db.commit()
+    await db.refresh(proposal)
+
+    peer_id = m.matched_user_id if m.user_id == user.id else m.user_id
+    await _notify_peer_best_effort(db, peer_id, user, "proposal", proposal.id)
+
+    return proposal
+
+
+def _build_scheduled_call_response(call: ScheduledCall, viewer: User,
+                                   user1: User, user2: User) -> ScheduledCallResponse:
+    """Construct a ScheduledCallResponse mirroring the legacy schedule_call shape."""
+    if call.user1_id == viewer.id:
+        other = user2
+        other_user_name = user2.name if user2 else "Unknown User"
+        other_user_id = call.user2_id
+    else:
+        other = user1
+        other_user_name = user1.name if user1 else "Unknown User"
+        other_user_id = call.user1_id
+
+    start_time_str = call.scheduled_start_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+    end_time_str = call.scheduled_end_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    return ScheduledCallResponse(
+        id=call.id,
+        user_id=viewer.id,
+        match_id=call.match_id,
+        user1_id=call.user1_id,
+        user2_id=call.user2_id,
+        user1_name=user1.name if user1 else None,
+        user2_name=user2.name if user2 else None,
+        other_user_name=other_user_name,
+        other_user_id=other_user_id,
+        other_user_firebase_uid=other.firebase_uid if other else None,
+        start_time_utc=start_time_str,
+        end_time_utc=end_time_str,
+        scheduled_start_utc=call.scheduled_start_utc,
+        scheduled_end_utc=call.scheduled_end_utc,
+        duration_minutes=call.duration_minutes,
+        status=call.status,
+        user1_confirmed=call.user1_confirmed,
+        user2_confirmed=call.user2_confirmed,
+        user1_confirmed_at=call.user1_confirmed_at,
+        user2_confirmed_at=call.user2_confirmed_at,
+        call_room_id=call.call_room_id,
+        call_started_at=call.call_started_at,
+        call_ended_at=call.call_ended_at,
+        actual_duration_minutes=call.actual_duration_minutes,
+        original_call_id=call.original_call_id,
+        reschedule_count=call.reschedule_count,
+        user1_notified=call.user1_notified,
+        user2_notified=call.user2_notified,
+        reminder_sent=call.reminder_sent,
+        created_at=call.created_at,
+        updated_at=call.updated_at,
+    )
+
+
+@router.post("/calls/{proposal_id}/accept", response_model=ScheduledCallResponse)
+async def accept_proposal(
+    proposal_id: int,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Flow 3 — the NON-proposer accepts a pending proposal, creating a
+    ScheduledCall (30 min) and flipping the match to call_status='scheduled'."""
+    proposal = (
+        await db.execute(
+            select(VideoCallProposal)
+            .where(VideoCallProposal.id == proposal_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if proposal is None:
+        raise HTTPException(status_code=404, detail="Proposal not found")
+    if proposal.status != "pending":
+        raise HTTPException(status_code=409, detail=f"Proposal is already {proposal.status}")
+
+    m = await mss._lock_match(db, proposal.match_id)
+    if not _is_participant(m, user.id):
+        raise HTTPException(status_code=403, detail="You are not a participant in this match")
+    if user.id == proposal.proposer_user_id:
+        raise HTTPException(status_code=403, detail="You cannot accept your own proposal")
+
+    now = mss.utc_now()
+    proposal.status = "accepted"
+    proposal.responded_at = now
+
+    call = ScheduledCall(
+        match_id=m.id,
+        user1_id=m.user_id,
+        user2_id=m.matched_user_id,
+        scheduled_start_utc=proposal.proposed_start_utc,
+        scheduled_end_utc=proposal.proposed_end_utc,
+        duration_minutes=mss.DATE_DURATION_MIN,
+        status="scheduled",
+    )
+    db.add(call)
+
+    m.call_status = "scheduled"
+
+    user1 = (await db.execute(select(User).where(User.id == m.user_id))).scalar_one_or_none()
+    user2 = (await db.execute(select(User).where(User.id == m.matched_user_id))).scalar_one_or_none()
+    if user1 is not None:
+        user1.total_calls_scheduled = (user1.total_calls_scheduled or 0) + 1
+    if user2 is not None:
+        user2.total_calls_scheduled = (user2.total_calls_scheduled or 0) + 1
+
+    await db.commit()
+    await db.refresh(call)
+    await db.refresh(user1)
+    await db.refresh(user2)
+
+    await _notify_peer_best_effort(db, proposal.proposer_user_id, user, "accepted", call.id)
+
+    return _build_scheduled_call_response(call, user, user1, user2)
+
+
+@router.post("/calls/{proposal_id}/counter", response_model=VideoCallProposalResponse)
+async def counter_proposal(
+    proposal_id: int,
+    body: CounterProposalRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Flow 6 — the NON-proposer counters the active proposal with a new time:
+    supersede the old pending proposal and insert a new pending one."""
+    start = _parse_start_utc(body.proposed_start_utc)
+    end = start + timedelta(minutes=mss.DATE_DURATION_MIN)
+
+    proposal = (
+        await db.execute(
+            select(VideoCallProposal)
+            .where(VideoCallProposal.id == proposal_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if proposal is None:
+        raise HTTPException(status_code=404, detail="Proposal not found")
+    if proposal.status != "pending":
+        raise HTTPException(status_code=409, detail=f"Proposal is already {proposal.status}")
+
+    m = await mss._lock_match(db, proposal.match_id)
+    if not _is_participant(m, user.id):
+        raise HTTPException(status_code=403, detail="You are not a participant in this match")
+    if user.id == proposal.proposer_user_id:
+        raise HTTPException(status_code=403, detail="Only the recipient can counter this proposal")
+
+    now = mss.utc_now()
+    # Supersede the old pending row and FLUSH before inserting the new pending
+    # row, otherwise the partial unique index (one 'pending' per match) rejects
+    # two pending rows existing simultaneously in the same transaction.
+    proposal.status = "superseded"
+    proposal.responded_at = now
+    await db.flush()
+
+    new_proposal = VideoCallProposal(
+        match_id=m.id,
+        proposer_user_id=user.id,
+        proposed_start_utc=start,
+        proposed_end_utc=end,
+        status="pending",
+    )
+    db.add(new_proposal)
+
+    if mss.is_legal_call_status(m.call_status, "proposal_pending"):
+        m.call_status = "proposal_pending"
+
+    await db.commit()
+    await db.refresh(new_proposal)
+
+    await _notify_peer_best_effort(db, proposal.proposer_user_id, user, "counter", new_proposal.id)
+
+    return new_proposal
+
 
 @router.put("/calls/{call_id}/extend", response_model=ScheduledCallResponse)
 async def extend_call(
