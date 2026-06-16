@@ -19,11 +19,11 @@ from app.models import (
 from app.schemas import (
     UserSchedulingPreferenceCreate, UserSchedulingPreferenceResponse,
     ScheduledCallCreate, ScheduledCallResponse,
-    # Proposal system schemas
-    SchedulingProposalCreate, SchedulingProposalResponse, ProposalResponseCreate,
-    ProposalResponseResponse, ProposalListResponse, ScheduledCallFromProposal,
-    ProposalStatus, ProposalResponseType
 )
+# TODO(v2): Legacy proposal/call-request schemas removed in Task 2.1. The proposal
+# and call-request endpoints below are dead and will be deleted in Task 9.1; their
+# response_model= decorators now use dict so the module still imports, and their
+# bodies (referencing the removed names) only NameError if invoked.
 from app.dependencies import verify_firebase_token, get_current_user
 import logging
 import traceback
@@ -533,477 +533,477 @@ async def cancel_call(
 # Scheduling Proposal System Endpoints
 # ============================================================================
 
-@router.post("/proposals", response_model=SchedulingProposalResponse)
-async def create_scheduling_proposal(
-    proposal_data: SchedulingProposalCreate,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-    """Create a new scheduling proposal with 2-3 time slot options"""
-    try:
-        # Verify match exists and user is part of it
-        match_result = await db.execute(
-            select(Match).where(
-                Match.id == proposal_data.match_id,
-                ((Match.user_id == user.id) | (Match.matched_user_id == user.id))
-            )
-        )
-        match = match_result.scalar_one_or_none()
-        if not match:
-            raise HTTPException(status_code=404, detail="Match not found or access denied")
-        
-        # Verify receiver is the other user in the match
-        if match.user_id == user.id:
-            if match.matched_user_id != proposal_data.receiver_id:
-                raise HTTPException(status_code=400, detail="Invalid receiver_id for this match")
-        else:
-            if match.user_id != proposal_data.receiver_id:
-                raise HTTPException(status_code=400, detail="Invalid receiver_id for this match")
-        
-        # Check for existing pending proposals
-        existing_result = await db.execute(
-            select(SchedulingProposal).where(
-                SchedulingProposal.match_id == proposal_data.match_id,
-                SchedulingProposal.status == ProposalStatus.PENDING
-            )
-        )
-        existing_proposal = existing_result.scalar_one_or_none()
-        if existing_proposal:
-            raise HTTPException(status_code=400, detail="A pending proposal already exists for this match")
-        
-        # Create proposal with 24-hour expiration
-        expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
-        proposal = SchedulingProposal(
-            match_id=proposal_data.match_id,
-            proposer_id=user.id,
-            receiver_id=proposal_data.receiver_id,
-            status=ProposalStatus.PENDING,
-            message=proposal_data.message,
-            expires_at=expires_at
-        )
-        db.add(proposal)
-        await db.flush()  # Get the proposal ID
-        
-        # Create time slots
-        for slot_data in proposal_data.time_slots:
-            time_slot = ProposalTimeSlot(
-                proposal_id=proposal.id,
-                start_time=slot_data.start_time,
-                end_time=slot_data.end_time,
-                is_selected=False
-            )
-            db.add(time_slot)
-        
-        await db.commit()
-        await db.refresh(proposal)
-        
-        # Load the proposal with relationships for response
-        result = await db.execute(
-            select(SchedulingProposal)
-            .options(
-                selectinload(SchedulingProposal.time_slots),
-                selectinload(SchedulingProposal.proposer),
-                selectinload(SchedulingProposal.receiver)
-            )
-            .where(SchedulingProposal.id == proposal.id)
-        )
-        proposal_with_relations = result.scalar_one()
-        
-        # S2 — notify the receiver that they have a new proposal to respond to
-        try:
-            await push.notify_proposal_received(
-                recipient=proposal_with_relations.receiver,
-                proposer=proposal_with_relations.proposer,
-                proposal_id=proposal_with_relations.id,
-            )
-        except Exception as exc:
-            logger.warning(f"[PUSH] S2 notification failed: {exc}")
-
-        return SchedulingProposalResponse(
-            id=proposal_with_relations.id,
-            match_id=proposal_with_relations.match_id,
-            proposer_id=proposal_with_relations.proposer_id,
-            receiver_id=proposal_with_relations.receiver_id,
-            status=proposal_with_relations.status,
-            message=proposal_with_relations.message,
-            created_at=proposal_with_relations.created_at,
-            expires_at=proposal_with_relations.expires_at,
-            responded_at=proposal_with_relations.responded_at,
-            proposer_name=proposal_with_relations.proposer.name,
-            receiver_name=proposal_with_relations.receiver.name,
-            time_slots=[
-                {
-                    "id": slot.id,
-                    "proposal_id": slot.proposal_id,
-                    "start_time": slot.start_time,
-                    "end_time": slot.end_time,
-                    "is_selected": slot.is_selected,
-                    "created_at": slot.created_at
-                }
-                for slot in proposal_with_relations.time_slots
-            ]
-        )
-
-    except Exception as e:
-        logger.error(f"Error creating proposal: {e}")
-        await db.rollback()
-        if isinstance(e, HTTPException):
-            raise
-        raise HTTPException(status_code=500, detail="Failed to create proposal")
-
-@router.get("/proposals", response_model=ProposalListResponse)
-async def get_user_proposals(
-    status: Optional[ProposalStatus] = None,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-    """Get proposals for the current user (both sent and received)"""
-    try:
-        # Build query for proposals where user is proposer or receiver
-        query = select(SchedulingProposal).options(
-            selectinload(SchedulingProposal.time_slots),
-            selectinload(SchedulingProposal.proposer),
-            selectinload(SchedulingProposal.receiver)
-        ).where(
-            (SchedulingProposal.proposer_id == user.id) |
-            (SchedulingProposal.receiver_id == user.id)
-        )
-        
-        if status:
-            query = query.where(SchedulingProposal.status == status)
-        
-        # Order by created_at descending
-        query = query.order_by(SchedulingProposal.created_at.desc())
-        
-        result = await db.execute(query)
-        proposals = result.scalars().all()
-        
-        # Count proposals by status
-        pending_count = len([p for p in proposals if p.status == ProposalStatus.PENDING])
-        responded_count = len([p for p in proposals if p.status != ProposalStatus.PENDING])
-        
-        proposal_responses = []
-        for proposal in proposals:
-            proposal_responses.append(SchedulingProposalResponse(
-                id=proposal.id,
-                match_id=proposal.match_id,
-                proposer_id=proposal.proposer_id,
-                receiver_id=proposal.receiver_id,
-                status=proposal.status,
-                message=proposal.message,
-                created_at=proposal.created_at,
-                expires_at=proposal.expires_at,
-                responded_at=proposal.responded_at,
-                proposer_name=proposal.proposer.name,
-                receiver_name=proposal.receiver.name,
-                time_slots=[
-                    {
-                        "id": slot.id,
-                        "proposal_id": slot.proposal_id,
-                        "start_time": slot.start_time,
-                        "end_time": slot.end_time,
-                        "is_selected": slot.is_selected,
-                        "created_at": slot.created_at
-                    }
-                    for slot in proposal.time_slots
-                ]
-            ))
-        
-        return ProposalListResponse(
-            proposals=proposal_responses,
-            total_count=len(proposals),
-            pending_count=pending_count,
-            responded_count=responded_count
-        )
-        
-    except Exception as e:
-        logger.error(f"Error getting proposals: {e}")
-        raise HTTPException(status_code=500, detail="Failed to get proposals")
-
-@router.get("/proposals/{proposal_id}", response_model=SchedulingProposalResponse)
-async def get_proposal(
-    proposal_id: int,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-    """Get a specific proposal by ID"""
-    try:
-        result = await db.execute(
-            select(SchedulingProposal)
-            .options(
-                selectinload(SchedulingProposal.time_slots),
-                selectinload(SchedulingProposal.proposer),
-                selectinload(SchedulingProposal.receiver)
-            )
-            .where(
-                SchedulingProposal.id == proposal_id,
-                ((SchedulingProposal.proposer_id == user.id) | (SchedulingProposal.receiver_id == user.id))
-            )
-        )
-        proposal = result.scalar_one_or_none()
-        
-        if not proposal:
-            raise HTTPException(status_code=404, detail="Proposal not found or access denied")
-        
-        return SchedulingProposalResponse(
-            id=proposal.id,
-            match_id=proposal.match_id,
-            proposer_id=proposal.proposer_id,
-            receiver_id=proposal.receiver_id,
-            status=proposal.status,
-            message=proposal.message,
-            created_at=proposal.created_at,
-            expires_at=proposal.expires_at,
-            responded_at=proposal.responded_at,
-            proposer_name=proposal.proposer.name,
-            receiver_name=proposal.receiver.name,
-            time_slots=[
-                {
-                    "id": slot.id,
-                    "proposal_id": slot.proposal_id,
-                    "start_time": slot.start_time,
-                    "end_time": slot.end_time,
-                    "is_selected": slot.is_selected,
-                    "created_at": slot.created_at
-                }
-                for slot in proposal.time_slots
-            ]
-        )
-        
-    except Exception as e:
-        logger.error(f"Error getting proposal {proposal_id}: {e}")
-        if isinstance(e, HTTPException):
-            raise
-        raise HTTPException(status_code=500, detail="Failed to get proposal")
-
-@router.post("/proposals/{proposal_id}/respond", response_model=ScheduledCallFromProposal)
-async def respond_to_proposal(
-    proposal_id: int,
-    response_data: ProposalResponseCreate,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-    """Respond to a scheduling proposal (accept/reject/counter-propose)"""
-    try:
-        # Get the proposal
-        result = await db.execute(
-            select(SchedulingProposal)
-            .options(
-                selectinload(SchedulingProposal.time_slots),
-                selectinload(SchedulingProposal.proposer),
-                selectinload(SchedulingProposal.receiver)
-            )
-            .where(SchedulingProposal.id == proposal_id)
-        )
-        proposal = result.scalar_one_or_none()
-        
-        if not proposal:
-            raise HTTPException(status_code=404, detail="Proposal not found")
-        
-        # Verify user is the receiver
-        if proposal.receiver_id != user.id:
-            raise HTTPException(status_code=403, detail="Only the proposal receiver can respond")
-        
-        # Check if proposal is still pending
-        if proposal.status != ProposalStatus.PENDING:
-            raise HTTPException(status_code=400, detail="Proposal is no longer pending")
-        
-        # Check if proposal has expired
-        if datetime.now(timezone.utc) > proposal.expires_at:
-            proposal.status = ProposalStatus.EXPIRED
-            await db.commit()
-            raise HTTPException(status_code=400, detail="Proposal has expired")
-        
-        # Create the response
-        proposal_response = ProposalResponse(
-            proposal_id=proposal.id,
-            response_type=response_data.response_type,
-            selected_slot_id=response_data.selected_slot_id,
-            counter_proposal_message=response_data.counter_proposal_message
-        )
-        db.add(proposal_response)
-        await db.flush()  # Get the response ID
-        
-        # Handle different response types
-        if response_data.response_type == ProposalResponseType.ACCEPT:
-            # Mark the selected slot and update proposal status
-            selected_slot_result = await db.execute(
-                select(ProposalTimeSlot).where(ProposalTimeSlot.id == response_data.selected_slot_id)
-            )
-            selected_slot = selected_slot_result.scalar_one()
-            selected_slot.is_selected = True
-
-            proposal.status = ProposalStatus.ACCEPTED
-            proposal.responded_at = datetime.now(timezone.utc)
-            
-            # Create a scheduled call
-            scheduled_call = ScheduledCall(
-                match_id=proposal.match_id,
-                user1_id=proposal.proposer_id,
-                user2_id=proposal.receiver_id,
-                scheduled_start_utc=selected_slot.start_time,
-                scheduled_end_utc=selected_slot.end_time,
-                duration_minutes=15,  # Fixed 15-minute calls
-                status="scheduled"
-            )
-            db.add(scheduled_call)
-            await db.commit()
-            await db.refresh(scheduled_call)
-
-            # Update match_outcomes funnel: stamp call_scheduled_at (best-effort)
-            try:
-                outcome_q = await db.execute(
-                    select(MatchOutcome).where(MatchOutcome.match_id == scheduled_call.match_id)
-                )
-                outcome = outcome_q.scalar_one_or_none()
-                if outcome and outcome.call_scheduled_at is None:
-                    outcome.call_scheduled_at = datetime.now(timezone.utc)
-                    await db.commit()
-            except Exception as exc:
-                logger.warning(f"Failed to update match_outcomes.call_scheduled_at on proposal accept: {exc}")
-
-            # S3 — notify the proposer that their proposal was accepted
-            try:
-                await push.notify_proposal_accepted(
-                    proposer=proposal.proposer,
-                    accepter=proposal.receiver,
-                    call_id=scheduled_call.id,
-                )
-            except Exception as exc:
-                logger.warning(f"[PUSH] S3 notification failed: {exc}")
-
-            # Return the scheduled call with proposal details
-            return ScheduledCallFromProposal(
-                call=ScheduledCallResponse(
-                    id=scheduled_call.id,
-                    user_id=user.id,
-                    match_id=scheduled_call.match_id,
-                    user1_id=scheduled_call.user1_id,
-                    user2_id=scheduled_call.user2_id,
-                    other_user_name=proposal.proposer.name,
-                    other_user_id=proposal.proposer_id,
-                    start_time_utc=selected_slot.start_time.isoformat() + 'Z',
-                    end_time_utc=selected_slot.end_time.isoformat() + 'Z',
-                    scheduled_start_utc=scheduled_call.scheduled_start_utc,
-                    scheduled_end_utc=scheduled_call.scheduled_end_utc,
-                    duration_minutes=scheduled_call.duration_minutes,
-                    status=scheduled_call.status,
-                    user1_confirmed=scheduled_call.user1_confirmed,
-                    user2_confirmed=scheduled_call.user2_confirmed,
-                    user1_confirmed_at=scheduled_call.user1_confirmed_at,
-                    user2_confirmed_at=scheduled_call.user2_confirmed_at,
-                    call_room_id=scheduled_call.call_room_id,
-                    call_started_at=scheduled_call.call_started_at,
-                    call_ended_at=scheduled_call.call_ended_at,
-                    actual_duration_minutes=scheduled_call.actual_duration_minutes,
-                    original_call_id=scheduled_call.original_call_id,
-                    reschedule_count=scheduled_call.reschedule_count,
-                    user1_notified=scheduled_call.user1_notified,
-                    user2_notified=scheduled_call.user2_notified,
-                    reminder_sent=scheduled_call.reminder_sent,
-                    created_at=scheduled_call.created_at,
-                    updated_at=scheduled_call.updated_at
-                ),
-                proposal=SchedulingProposalResponse(
-                    id=proposal.id,
-                    match_id=proposal.match_id,
-                    proposer_id=proposal.proposer_id,
-                    receiver_id=proposal.receiver_id,
-                    status=proposal.status,
-                    message=proposal.message,
-                    created_at=proposal.created_at,
-                    expires_at=proposal.expires_at,
-                    responded_at=proposal.responded_at,
-                    proposer_name=proposal.proposer.name,
-                    receiver_name=proposal.receiver.name,
-                    time_slots=[
-                        {
-                            "id": slot.id,
-                            "proposal_id": slot.proposal_id,
-                            "start_time": slot.start_time,
-                            "end_time": slot.end_time,
-                            "is_selected": slot.is_selected,
-                            "created_at": slot.created_at
-                        }
-                        for slot in proposal.time_slots
-                    ]
-                )
-            )
-            
-        elif response_data.response_type == ProposalResponseType.REJECT:
-            proposal.status = ProposalStatus.REJECTED
-            proposal.responded_at = datetime.now(timezone.utc)
-            await db.commit()
-
-            # S4 — notify the proposer that their proposal was rejected
-            try:
-                await push.notify_proposal_rejected(
-                    proposer=proposal.proposer, rejecter=proposal.receiver
-                )
-            except Exception as exc:
-                logger.warning(f"[PUSH] S4 notification failed: {exc}")
-
-        elif response_data.response_type == ProposalResponseType.COUNTER_PROPOSE:
-            # Add counter proposal time slots
-            if response_data.counter_time_slots:
-                for counter_slot_data in response_data.counter_time_slots:
-                    counter_slot = CounterProposalTimeSlot(
-                        response_id=proposal_response.id,
-                        start_time=counter_slot_data.start_time,
-                        end_time=counter_slot_data.end_time
-                    )
-                    db.add(counter_slot)
-
-            proposal.status = ProposalStatus.COUNTER_PROPOSED
-            proposal.responded_at = datetime.now(timezone.utc)
-            await db.commit()
-
-            # S9 — notify the original proposer of the counter-proposal
-            try:
-                await push.notify_counter_proposal_received(
-                    recipient=proposal.proposer,
-                    proposer=proposal.receiver,
-                    proposal_id=proposal.id,
-                )
-            except Exception as exc:
-                logger.warning(f"[PUSH] S9 notification failed: {exc}")
-        
-        # For reject and counter-propose, return empty call but with proposal details
-        return ScheduledCallFromProposal(
-            call=None,
-            proposal=SchedulingProposalResponse(
-                id=proposal.id,
-                match_id=proposal.match_id,
-                proposer_id=proposal.proposer_id,
-                receiver_id=proposal.receiver_id,
-                status=proposal.status,
-                message=proposal.message,
-                created_at=proposal.created_at,
-                expires_at=proposal.expires_at,
-                responded_at=proposal.responded_at,
-                proposer_name=proposal.proposer.name,
-                receiver_name=proposal.receiver.name,
-                time_slots=[
-                    {
-                        "id": slot.id,
-                        "proposal_id": slot.proposal_id,
-                        "start_time": slot.start_time,
-                        "end_time": slot.end_time,
-                        "is_selected": slot.is_selected,
-                        "created_at": slot.created_at
-                    }
-                    for slot in proposal.time_slots
-                ]
-            ),
-            message=f"Proposal {response_data.response_type.value}ed successfully"
-        )
-        
-    except Exception as e:
-        logger.error(f"Error responding to proposal {proposal_id}: {e}")
-        await db.rollback()
-        if isinstance(e, HTTPException):
-            raise
-        raise HTTPException(status_code=500, detail="Failed to respond to proposal")
+# @router.post("/proposals", response_model=dict)  # TODO(v2): dead, removed in Task 9.1
+# async def create_scheduling_proposal(
+#     proposal_data: SchedulingProposalCreate,
+#     user: User = Depends(get_current_user),
+#     db: AsyncSession = Depends(get_db)
+# ):
+#     """Create a new scheduling proposal with 2-3 time slot options"""
+#     try:
+#         # Verify match exists and user is part of it
+#         match_result = await db.execute(
+#             select(Match).where(
+#                 Match.id == proposal_data.match_id,
+#                 ((Match.user_id == user.id) | (Match.matched_user_id == user.id))
+#             )
+#         )
+#         match = match_result.scalar_one_or_none()
+#         if not match:
+#             raise HTTPException(status_code=404, detail="Match not found or access denied")
+#         
+#         # Verify receiver is the other user in the match
+#         if match.user_id == user.id:
+#             if match.matched_user_id != proposal_data.receiver_id:
+#                 raise HTTPException(status_code=400, detail="Invalid receiver_id for this match")
+#         else:
+#             if match.user_id != proposal_data.receiver_id:
+#                 raise HTTPException(status_code=400, detail="Invalid receiver_id for this match")
+#         
+#         # Check for existing pending proposals
+#         existing_result = await db.execute(
+#             select(SchedulingProposal).where(
+#                 SchedulingProposal.match_id == proposal_data.match_id,
+#                 SchedulingProposal.status == ProposalStatus.PENDING
+#             )
+#         )
+#         existing_proposal = existing_result.scalar_one_or_none()
+#         if existing_proposal:
+#             raise HTTPException(status_code=400, detail="A pending proposal already exists for this match")
+#         
+#         # Create proposal with 24-hour expiration
+#         expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
+#         proposal = SchedulingProposal(
+#             match_id=proposal_data.match_id,
+#             proposer_id=user.id,
+#             receiver_id=proposal_data.receiver_id,
+#             status=ProposalStatus.PENDING,
+#             message=proposal_data.message,
+#             expires_at=expires_at
+#         )
+#         db.add(proposal)
+#         await db.flush()  # Get the proposal ID
+#         
+#         # Create time slots
+#         for slot_data in proposal_data.time_slots:
+#             time_slot = ProposalTimeSlot(
+#                 proposal_id=proposal.id,
+#                 start_time=slot_data.start_time,
+#                 end_time=slot_data.end_time,
+#                 is_selected=False
+#             )
+#             db.add(time_slot)
+#         
+#         await db.commit()
+#         await db.refresh(proposal)
+#         
+#         # Load the proposal with relationships for response
+#         result = await db.execute(
+#             select(SchedulingProposal)
+#             .options(
+#                 selectinload(SchedulingProposal.time_slots),
+#                 selectinload(SchedulingProposal.proposer),
+#                 selectinload(SchedulingProposal.receiver)
+#             )
+#             .where(SchedulingProposal.id == proposal.id)
+#         )
+#         proposal_with_relations = result.scalar_one()
+#         
+#         # S2 — notify the receiver that they have a new proposal to respond to
+#         try:
+#             await push.notify_proposal_received(
+#                 recipient=proposal_with_relations.receiver,
+#                 proposer=proposal_with_relations.proposer,
+#                 proposal_id=proposal_with_relations.id,
+#             )
+#         except Exception as exc:
+#             logger.warning(f"[PUSH] S2 notification failed: {exc}")
+# 
+#         return SchedulingProposalResponse(
+#             id=proposal_with_relations.id,
+#             match_id=proposal_with_relations.match_id,
+#             proposer_id=proposal_with_relations.proposer_id,
+#             receiver_id=proposal_with_relations.receiver_id,
+#             status=proposal_with_relations.status,
+#             message=proposal_with_relations.message,
+#             created_at=proposal_with_relations.created_at,
+#             expires_at=proposal_with_relations.expires_at,
+#             responded_at=proposal_with_relations.responded_at,
+#             proposer_name=proposal_with_relations.proposer.name,
+#             receiver_name=proposal_with_relations.receiver.name,
+#             time_slots=[
+#                 {
+#                     "id": slot.id,
+#                     "proposal_id": slot.proposal_id,
+#                     "start_time": slot.start_time,
+#                     "end_time": slot.end_time,
+#                     "is_selected": slot.is_selected,
+#                     "created_at": slot.created_at
+#                 }
+#                 for slot in proposal_with_relations.time_slots
+#             ]
+#         )
+# 
+#     except Exception as e:
+#         logger.error(f"Error creating proposal: {e}")
+#         await db.rollback()
+#         if isinstance(e, HTTPException):
+#             raise
+#         raise HTTPException(status_code=500, detail="Failed to create proposal")
+# 
+# @router.get("/proposals", response_model=dict)  # TODO(v2): dead, removed in Task 9.1
+# async def get_user_proposals(
+#     status: Optional[ProposalStatus] = None,
+#     user: User = Depends(get_current_user),
+#     db: AsyncSession = Depends(get_db)
+# ):
+#     """Get proposals for the current user (both sent and received)"""
+#     try:
+#         # Build query for proposals where user is proposer or receiver
+#         query = select(SchedulingProposal).options(
+#             selectinload(SchedulingProposal.time_slots),
+#             selectinload(SchedulingProposal.proposer),
+#             selectinload(SchedulingProposal.receiver)
+#         ).where(
+#             (SchedulingProposal.proposer_id == user.id) |
+#             (SchedulingProposal.receiver_id == user.id)
+#         )
+#         
+#         if status:
+#             query = query.where(SchedulingProposal.status == status)
+#         
+#         # Order by created_at descending
+#         query = query.order_by(SchedulingProposal.created_at.desc())
+#         
+#         result = await db.execute(query)
+#         proposals = result.scalars().all()
+#         
+#         # Count proposals by status
+#         pending_count = len([p for p in proposals if p.status == ProposalStatus.PENDING])
+#         responded_count = len([p for p in proposals if p.status != ProposalStatus.PENDING])
+#         
+#         proposal_responses = []
+#         for proposal in proposals:
+#             proposal_responses.append(SchedulingProposalResponse(
+#                 id=proposal.id,
+#                 match_id=proposal.match_id,
+#                 proposer_id=proposal.proposer_id,
+#                 receiver_id=proposal.receiver_id,
+#                 status=proposal.status,
+#                 message=proposal.message,
+#                 created_at=proposal.created_at,
+#                 expires_at=proposal.expires_at,
+#                 responded_at=proposal.responded_at,
+#                 proposer_name=proposal.proposer.name,
+#                 receiver_name=proposal.receiver.name,
+#                 time_slots=[
+#                     {
+#                         "id": slot.id,
+#                         "proposal_id": slot.proposal_id,
+#                         "start_time": slot.start_time,
+#                         "end_time": slot.end_time,
+#                         "is_selected": slot.is_selected,
+#                         "created_at": slot.created_at
+#                     }
+#                     for slot in proposal.time_slots
+#                 ]
+#             ))
+#         
+#         return ProposalListResponse(
+#             proposals=proposal_responses,
+#             total_count=len(proposals),
+#             pending_count=pending_count,
+#             responded_count=responded_count
+#         )
+#         
+#     except Exception as e:
+#         logger.error(f"Error getting proposals: {e}")
+#         raise HTTPException(status_code=500, detail="Failed to get proposals")
+# 
+# @router.get("/proposals/{proposal_id}", response_model=dict)  # TODO(v2): dead, removed in Task 9.1
+# async def get_proposal(
+#     proposal_id: int,
+#     user: User = Depends(get_current_user),
+#     db: AsyncSession = Depends(get_db)
+# ):
+#     """Get a specific proposal by ID"""
+#     try:
+#         result = await db.execute(
+#             select(SchedulingProposal)
+#             .options(
+#                 selectinload(SchedulingProposal.time_slots),
+#                 selectinload(SchedulingProposal.proposer),
+#                 selectinload(SchedulingProposal.receiver)
+#             )
+#             .where(
+#                 SchedulingProposal.id == proposal_id,
+#                 ((SchedulingProposal.proposer_id == user.id) | (SchedulingProposal.receiver_id == user.id))
+#             )
+#         )
+#         proposal = result.scalar_one_or_none()
+#         
+#         if not proposal:
+#             raise HTTPException(status_code=404, detail="Proposal not found or access denied")
+#         
+#         return SchedulingProposalResponse(
+#             id=proposal.id,
+#             match_id=proposal.match_id,
+#             proposer_id=proposal.proposer_id,
+#             receiver_id=proposal.receiver_id,
+#             status=proposal.status,
+#             message=proposal.message,
+#             created_at=proposal.created_at,
+#             expires_at=proposal.expires_at,
+#             responded_at=proposal.responded_at,
+#             proposer_name=proposal.proposer.name,
+#             receiver_name=proposal.receiver.name,
+#             time_slots=[
+#                 {
+#                     "id": slot.id,
+#                     "proposal_id": slot.proposal_id,
+#                     "start_time": slot.start_time,
+#                     "end_time": slot.end_time,
+#                     "is_selected": slot.is_selected,
+#                     "created_at": slot.created_at
+#                 }
+#                 for slot in proposal.time_slots
+#             ]
+#         )
+#         
+#     except Exception as e:
+#         logger.error(f"Error getting proposal {proposal_id}: {e}")
+#         if isinstance(e, HTTPException):
+#             raise
+#         raise HTTPException(status_code=500, detail="Failed to get proposal")
+# 
+# @router.post("/proposals/{proposal_id}/respond", response_model=dict)  # TODO(v2): dead, removed in Task 9.1
+# async def respond_to_proposal(
+#     proposal_id: int,
+#     response_data: ProposalResponseCreate,
+#     user: User = Depends(get_current_user),
+#     db: AsyncSession = Depends(get_db)
+# ):
+#     """Respond to a scheduling proposal (accept/reject/counter-propose)"""
+#     try:
+#         # Get the proposal
+#         result = await db.execute(
+#             select(SchedulingProposal)
+#             .options(
+#                 selectinload(SchedulingProposal.time_slots),
+#                 selectinload(SchedulingProposal.proposer),
+#                 selectinload(SchedulingProposal.receiver)
+#             )
+#             .where(SchedulingProposal.id == proposal_id)
+#         )
+#         proposal = result.scalar_one_or_none()
+#         
+#         if not proposal:
+#             raise HTTPException(status_code=404, detail="Proposal not found")
+#         
+#         # Verify user is the receiver
+#         if proposal.receiver_id != user.id:
+#             raise HTTPException(status_code=403, detail="Only the proposal receiver can respond")
+#         
+#         # Check if proposal is still pending
+#         if proposal.status != ProposalStatus.PENDING:
+#             raise HTTPException(status_code=400, detail="Proposal is no longer pending")
+#         
+#         # Check if proposal has expired
+#         if datetime.now(timezone.utc) > proposal.expires_at:
+#             proposal.status = ProposalStatus.EXPIRED
+#             await db.commit()
+#             raise HTTPException(status_code=400, detail="Proposal has expired")
+#         
+#         # Create the response
+#         proposal_response = ProposalResponse(
+#             proposal_id=proposal.id,
+#             response_type=response_data.response_type,
+#             selected_slot_id=response_data.selected_slot_id,
+#             counter_proposal_message=response_data.counter_proposal_message
+#         )
+#         db.add(proposal_response)
+#         await db.flush()  # Get the response ID
+#         
+#         # Handle different response types
+#         if response_data.response_type == ProposalResponseType.ACCEPT:
+#             # Mark the selected slot and update proposal status
+#             selected_slot_result = await db.execute(
+#                 select(ProposalTimeSlot).where(ProposalTimeSlot.id == response_data.selected_slot_id)
+#             )
+#             selected_slot = selected_slot_result.scalar_one()
+#             selected_slot.is_selected = True
+# 
+#             proposal.status = ProposalStatus.ACCEPTED
+#             proposal.responded_at = datetime.now(timezone.utc)
+#             
+#             # Create a scheduled call
+#             scheduled_call = ScheduledCall(
+#                 match_id=proposal.match_id,
+#                 user1_id=proposal.proposer_id,
+#                 user2_id=proposal.receiver_id,
+#                 scheduled_start_utc=selected_slot.start_time,
+#                 scheduled_end_utc=selected_slot.end_time,
+#                 duration_minutes=15,  # Fixed 15-minute calls
+#                 status="scheduled"
+#             )
+#             db.add(scheduled_call)
+#             await db.commit()
+#             await db.refresh(scheduled_call)
+# 
+#             # Update match_outcomes funnel: stamp call_scheduled_at (best-effort)
+#             try:
+#                 outcome_q = await db.execute(
+#                     select(MatchOutcome).where(MatchOutcome.match_id == scheduled_call.match_id)
+#                 )
+#                 outcome = outcome_q.scalar_one_or_none()
+#                 if outcome and outcome.call_scheduled_at is None:
+#                     outcome.call_scheduled_at = datetime.now(timezone.utc)
+#                     await db.commit()
+#             except Exception as exc:
+#                 logger.warning(f"Failed to update match_outcomes.call_scheduled_at on proposal accept: {exc}")
+# 
+#             # S3 — notify the proposer that their proposal was accepted
+#             try:
+#                 await push.notify_proposal_accepted(
+#                     proposer=proposal.proposer,
+#                     accepter=proposal.receiver,
+#                     call_id=scheduled_call.id,
+#                 )
+#             except Exception as exc:
+#                 logger.warning(f"[PUSH] S3 notification failed: {exc}")
+# 
+#             # Return the scheduled call with proposal details
+#             return ScheduledCallFromProposal(
+#                 call=ScheduledCallResponse(
+#                     id=scheduled_call.id,
+#                     user_id=user.id,
+#                     match_id=scheduled_call.match_id,
+#                     user1_id=scheduled_call.user1_id,
+#                     user2_id=scheduled_call.user2_id,
+#                     other_user_name=proposal.proposer.name,
+#                     other_user_id=proposal.proposer_id,
+#                     start_time_utc=selected_slot.start_time.isoformat() + 'Z',
+#                     end_time_utc=selected_slot.end_time.isoformat() + 'Z',
+#                     scheduled_start_utc=scheduled_call.scheduled_start_utc,
+#                     scheduled_end_utc=scheduled_call.scheduled_end_utc,
+#                     duration_minutes=scheduled_call.duration_minutes,
+#                     status=scheduled_call.status,
+#                     user1_confirmed=scheduled_call.user1_confirmed,
+#                     user2_confirmed=scheduled_call.user2_confirmed,
+#                     user1_confirmed_at=scheduled_call.user1_confirmed_at,
+#                     user2_confirmed_at=scheduled_call.user2_confirmed_at,
+#                     call_room_id=scheduled_call.call_room_id,
+#                     call_started_at=scheduled_call.call_started_at,
+#                     call_ended_at=scheduled_call.call_ended_at,
+#                     actual_duration_minutes=scheduled_call.actual_duration_minutes,
+#                     original_call_id=scheduled_call.original_call_id,
+#                     reschedule_count=scheduled_call.reschedule_count,
+#                     user1_notified=scheduled_call.user1_notified,
+#                     user2_notified=scheduled_call.user2_notified,
+#                     reminder_sent=scheduled_call.reminder_sent,
+#                     created_at=scheduled_call.created_at,
+#                     updated_at=scheduled_call.updated_at
+#                 ),
+#                 proposal=SchedulingProposalResponse(
+#                     id=proposal.id,
+#                     match_id=proposal.match_id,
+#                     proposer_id=proposal.proposer_id,
+#                     receiver_id=proposal.receiver_id,
+#                     status=proposal.status,
+#                     message=proposal.message,
+#                     created_at=proposal.created_at,
+#                     expires_at=proposal.expires_at,
+#                     responded_at=proposal.responded_at,
+#                     proposer_name=proposal.proposer.name,
+#                     receiver_name=proposal.receiver.name,
+#                     time_slots=[
+#                         {
+#                             "id": slot.id,
+#                             "proposal_id": slot.proposal_id,
+#                             "start_time": slot.start_time,
+#                             "end_time": slot.end_time,
+#                             "is_selected": slot.is_selected,
+#                             "created_at": slot.created_at
+#                         }
+#                         for slot in proposal.time_slots
+#                     ]
+#                 )
+#             )
+#             
+#         elif response_data.response_type == ProposalResponseType.REJECT:
+#             proposal.status = ProposalStatus.REJECTED
+#             proposal.responded_at = datetime.now(timezone.utc)
+#             await db.commit()
+# 
+#             # S4 — notify the proposer that their proposal was rejected
+#             try:
+#                 await push.notify_proposal_rejected(
+#                     proposer=proposal.proposer, rejecter=proposal.receiver
+#                 )
+#             except Exception as exc:
+#                 logger.warning(f"[PUSH] S4 notification failed: {exc}")
+# 
+#         elif response_data.response_type == ProposalResponseType.COUNTER_PROPOSE:
+#             # Add counter proposal time slots
+#             if response_data.counter_time_slots:
+#                 for counter_slot_data in response_data.counter_time_slots:
+#                     counter_slot = CounterProposalTimeSlot(
+#                         response_id=proposal_response.id,
+#                         start_time=counter_slot_data.start_time,
+#                         end_time=counter_slot_data.end_time
+#                     )
+#                     db.add(counter_slot)
+# 
+#             proposal.status = ProposalStatus.COUNTER_PROPOSED
+#             proposal.responded_at = datetime.now(timezone.utc)
+#             await db.commit()
+# 
+#             # S9 — notify the original proposer of the counter-proposal
+#             try:
+#                 await push.notify_counter_proposal_received(
+#                     recipient=proposal.proposer,
+#                     proposer=proposal.receiver,
+#                     proposal_id=proposal.id,
+#                 )
+#             except Exception as exc:
+#                 logger.warning(f"[PUSH] S9 notification failed: {exc}")
+#         
+#         # For reject and counter-propose, return empty call but with proposal details
+#         return ScheduledCallFromProposal(
+#             call=None,
+#             proposal=SchedulingProposalResponse(
+#                 id=proposal.id,
+#                 match_id=proposal.match_id,
+#                 proposer_id=proposal.proposer_id,
+#                 receiver_id=proposal.receiver_id,
+#                 status=proposal.status,
+#                 message=proposal.message,
+#                 created_at=proposal.created_at,
+#                 expires_at=proposal.expires_at,
+#                 responded_at=proposal.responded_at,
+#                 proposer_name=proposal.proposer.name,
+#                 receiver_name=proposal.receiver.name,
+#                 time_slots=[
+#                     {
+#                         "id": slot.id,
+#                         "proposal_id": slot.proposal_id,
+#                         "start_time": slot.start_time,
+#                         "end_time": slot.end_time,
+#                         "is_selected": slot.is_selected,
+#                         "created_at": slot.created_at
+#                     }
+#                     for slot in proposal.time_slots
+#                 ]
+#             ),
+#             message=f"Proposal {response_data.response_type.value}ed successfully"
+#         )
+#         
+#     except Exception as e:
+#         logger.error(f"Error responding to proposal {proposal_id}: {e}")
+#         await db.rollback()
+#         if isinstance(e, HTTPException):
+#             raise
+#         raise HTTPException(status_code=500, detail="Failed to respond to proposal")
 
 
 # ============================================================================

@@ -564,166 +564,60 @@ class SchedulingPreferences(SchedulingPreferencesCreate):
         from_attributes = True
 
 # ============================================================================
-# Scheduling Proposal System Schemas
+# Scheduling V2 Schemas
 # ============================================================================
 
-class ProposalStatus(str, Enum):
-    """Status values for scheduling proposals"""
-    PENDING = "pending"
-    ACCEPTED = "accepted" 
-    REJECTED = "rejected"
-    COUNTER_PROPOSED = "counter_proposed"
-    EXPIRED = "expired"
+class TextState(str, Enum):
+    OPEN = "open"; LOCKED = "locked"; ARCHIVED = "archived"
 
-class ProposalResponseType(str, Enum):
-    """Response types for proposal responses"""
-    ACCEPT = "accept"
-    REJECT = "reject"
-    COUNTER_PROPOSE = "counter_propose"
+class CallLifecycleStatus(str, Enum):   # distinct from the existing CallStatus enum
+    NONE = "none"; PROPOSAL_PENDING = "proposal_pending"; SCHEDULED = "scheduled"
+    IN_PROGRESS = "in_progress"; PENDING_SURVEY = "pending_survey"
+    COMPLETED = "completed"; NO_SHOW = "no_show"
 
-class ProposalTimeSlotCreate(BaseModel):
-    """Time slot for proposal creation"""
-    start_time: datetime = Field(..., description="Start time in UTC")
-    end_time: datetime = Field(..., description="End time in UTC")
-    
-    @validator('end_time')
-    def end_time_must_be_after_start_time(cls, v, values):
-        if 'start_time' in values and v <= values['start_time']:
-            raise ValueError('end_time must be after start_time')
-        return v
-    
-    @validator('start_time')
-    def start_time_must_be_future(cls, v):
-        if v <= datetime.now(timezone.utc):
-            raise ValueError('start_time must be in the future')
-        return v
+class MatchLifecycle(str, Enum):
+    ACTIVE = "active"; TERMINATED = "terminated"; EXPIRED = "expired"
 
-class ProposalTimeSlotResponse(BaseModel):
-    """Time slot response with ID"""
-    id: int
-    proposal_id: int
-    start_time: datetime
-    end_time: datetime
-    is_selected: bool
-    created_at: datetime
-    
-    class Config:
-        from_attributes = True
-
-class SchedulingProposalCreate(BaseModel):
-    """Create a new scheduling proposal"""
-    match_id: int = Field(..., description="Match ID for the proposal")
-    receiver_id: int = Field(..., description="User ID of the proposal receiver")
-    time_slots: List[ProposalTimeSlotCreate] = Field(..., min_items=2, max_items=3, 
-                                                    description="2-3 time slot options")
-    message: Optional[str] = Field(None, max_length=500, description="Optional message")
-    
-    @validator('time_slots')
-    def validate_time_slots(cls, v):
-        if len(v) < 2:
-            raise ValueError('Must provide at least 2 time slot options')
-        if len(v) > 3:
-            raise ValueError('Cannot provide more than 3 time slot options')
-        return v
-
-class SchedulingProposalResponse(BaseModel):
-    """Response for scheduling proposal"""
-    id: int
+class ProposeCallRequest(BaseModel):
     match_id: int
-    proposer_id: int
-    receiver_id: int
-    status: ProposalStatus
-    message: Optional[str]
-    created_at: datetime
-    expires_at: datetime
-    responded_at: Optional[datetime]
-    
-    # Include proposer and receiver names for display
-    proposer_name: Optional[str] = None
-    receiver_name: Optional[str] = None
-    
-    # Include time slots
-    time_slots: List[ProposalTimeSlotResponse]
-    
-    class Config:
-        from_attributes = True
+    proposed_start_utc: datetime
 
-class CounterProposalTimeSlotCreate(BaseModel):
-    """Time slot for counter proposal"""
-    start_time: datetime = Field(..., description="Start time in UTC")
-    end_time: datetime = Field(..., description="End time in UTC")
-    
-    @validator('end_time')
-    def end_time_must_be_after_start_time(cls, v, values):
-        if 'start_time' in values and v <= values['start_time']:
-            raise ValueError('end_time must be after start_time')
-        return v
+class CounterProposalRequest(BaseModel):
+    proposed_start_utc: datetime
 
-class CounterProposalTimeSlotResponse(BaseModel):
-    """Counter proposal time slot response"""
-    id: int
-    response_id: int
-    start_time: datetime
-    end_time: datetime
-    created_at: datetime
-    
-    class Config:
-        from_attributes = True
+class VideoCallProposalResponse(BaseModel):
+    id: int; match_id: int; proposer_user_id: int
+    proposed_start_utc: datetime; proposed_end_utc: datetime
+    status: str
+    class Config: from_attributes = True
 
-class ProposalResponseCreate(BaseModel):
-    """Create a response to a scheduling proposal"""
-    response_type: ProposalResponseType = Field(..., description="Type of response")
-    selected_slot_id: Optional[int] = Field(None, description="ID of selected slot (for accepts)")
-    counter_proposal_message: Optional[str] = Field(None, max_length=500, 
-                                                  description="Message for counter proposals")
-    counter_time_slots: Optional[List[CounterProposalTimeSlotCreate]] = Field(None, 
-                                                                              description="Time slots for counter proposals")
-    
-    @validator('selected_slot_id')
-    def validate_selected_slot_for_accept(cls, v, values):
-        if values.get('response_type') == ProposalResponseType.ACCEPT and v is None:
-            raise ValueError('selected_slot_id is required when accepting a proposal')
-        if values.get('response_type') != ProposalResponseType.ACCEPT and v is not None:
-            raise ValueError('selected_slot_id should only be provided when accepting')
-        return v
-    
-    @validator('counter_time_slots')
-    def validate_counter_time_slots(cls, v, values):
-        if values.get('response_type') == ProposalResponseType.COUNTER_PROPOSE:
-            if not v or len(v) < 2 or len(v) > 3:
-                raise ValueError('Counter proposals must include 2-3 time slot options')
-        elif v is not None:
-            raise ValueError('counter_time_slots should only be provided for counter proposals')
-        return v
+class ExitSurveyRequest(BaseModel):
+    response: bool
 
-class ProposalResponseResponse(BaseModel):
-    """Response for proposal response"""
-    id: int
-    proposal_id: int
-    response_type: ProposalResponseType
-    selected_slot_id: Optional[int]
-    counter_proposal_message: Optional[str]
-    created_at: datetime
-    
-    # Include counter proposal time slots if applicable
-    counter_time_slots: List[CounterProposalTimeSlotResponse] = []
-    
-    class Config:
-        from_attributes = True
+class ExitSurveyResultResponse(BaseModel):
+    match_lifecycle: str; call_status: str; text_state: str; contact_reveal_unlocked: bool
 
-class ProposalListResponse(BaseModel):
-    """Response for listing proposals"""
-    proposals: List[SchedulingProposalResponse]
-    total_count: int
-    pending_count: int
-    responded_count: int
+class ContactResponse(BaseModel):
+    peer_phone_number: Optional[str] = None
+    peer_phone_country_code: Optional[str] = None
 
-class ScheduledCallFromProposal(BaseModel):
-    """Response when a proposal is accepted and converted to a scheduled call"""
-    call: ScheduledCallResponse
-    proposal: SchedulingProposalResponse
-    message: str = "Proposal accepted and call scheduled successfully"
+class PeerUserSummary(BaseModel):
+    id: int; name: Optional[str] = None; timezone: Optional[str] = None
+    no_show_count: int = 0
+    class Config: from_attributes = True
 
+class MatchListItem(BaseModel):
+    match_id: int
+    peer_user: PeerUserSummary
+    text_state: str; call_status: str; lifecycle: str
+    text_locked_at: Optional[datetime] = None
+    expires_at: Optional[datetime] = None
+    card_display: str
+    active_proposal: Optional[VideoCallProposalResponse] = None
+    scheduled_call: Optional[ScheduledCallResponse] = None
+    exit_survey_self_response: Optional[bool] = None
+    exit_survey_peer_response: Optional[bool] = None
+    contact_reveal_unlocked: bool = False
 
 # ============================================================================
 # Video Call Room Schemas
@@ -768,34 +662,6 @@ class VideoCallRoomStatusResponse(BaseModel):
     status: str = Field(..., description="Room status: active, ended, or expired")
     created_at: datetime = Field(..., description="When the room was created")
     ended_at: Optional[datetime] = Field(None, description="When the room was ended")
-
-    class Config:
-        from_attributes = True
-
-
-# ── Tier 1 spontaneous call-request schemas ──────────────────────────────────
-
-class CallRequestCreate(BaseModel):
-    match_id: int
-
-class CallRequestUserInfo(BaseModel):
-    id: int
-    name: Optional[str] = None
-    profile_image_url: Optional[str] = None
-    firebase_uid: str
-
-    class Config:
-        from_attributes = True
-
-class CallRequestResponse(BaseModel):
-    id: int
-    match_id: int
-    requester: CallRequestUserInfo
-    recipient: CallRequestUserInfo
-    status: str                         # pending | accepted | declined | expired
-    room_name: Optional[str] = None     # populated once accepted
-    created_at: datetime
-    expires_at: datetime
 
     class Config:
         from_attributes = True
