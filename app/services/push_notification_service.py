@@ -82,23 +82,6 @@ def _no_token(user_name: str, notification_type: str) -> None:
 # Typed notification functions
 # ---------------------------------------------------------------------------
 
-async def notify_immediate_call_request(recipient, caller, call_id: int) -> None:
-    """S1 — User B gets notified when User A taps 'Call Now'."""
-    if not _push_enabled(recipient):
-        _no_token(recipient.name or "?", "immediate_call_request")
-        return
-    await send_push(
-        token=recipient.device_token,
-        title=f"{caller.name or 'Someone'} wants to call now!",
-        body="They're available right now for a 15-min video call. Tap to join.",
-        data={
-            "type": "immediate_call_request",
-            "caller_name": caller.name or "",
-            "call_id": call_id,
-        },
-    )
-
-
 # ---------------------------------------------------------------------------
 # Scheduling V2 — typed senders (Task 7.1)
 #
@@ -111,48 +94,6 @@ async def notify_immediate_call_request(recipient, caller, call_id: int) -> None
 
 def _name(user) -> str:
     return (getattr(user, "name", None) or "Someone")
-
-
-async def notify_call_reminder(user, call, minutes_before: int) -> None:
-    """S5/S6 — Remind both users before a scheduled call."""
-    if not _push_enabled(user):
-        _no_token(user.name or "?", f"call_reminder_{minutes_before}min")
-        return
-
-    if minutes_before >= 60:
-        title = "Call starting in 1 hour"
-        body = "Your 15-min video call is coming up. Get ready!"
-    else:
-        title = f"Call starting in {minutes_before} minutes"
-        body = "Your video call is almost here. Tap to join when ready."
-
-    await send_push(
-        token=user.device_token,
-        title=title,
-        body=body,
-        data={
-            "type": "call_reminder",
-            "call_id": call.id,
-            "minutes_before": minutes_before,
-        },
-    )
-
-
-async def notify_match_expiring(user, match_name: str, hours_left: int) -> None:
-    """S7 — Both users notified when the 48h scheduling window is almost closed."""
-    if not _push_enabled(user):
-        _no_token(user.name or "?", "match_expiring")
-        return
-    await send_push(
-        token=user.device_token,
-        title=f"Schedule your call with {match_name}!",
-        body=f"Only {hours_left} hours left to schedule your 15-min call before the match expires.",
-        data={
-            "type": "match_expiring",
-            "match_name": match_name,
-            "hours_left": hours_left,
-        },
-    )
 
 
 async def notify_new_match(recipient, matcher_name: str, match_id: int) -> None:
@@ -168,23 +109,6 @@ async def notify_new_match(recipient, matcher_name: str, match_id: int) -> None:
             "type": "new_match",
             "matcher_name": matcher_name,
             "match_id": match_id,
-        },
-    )
-
-
-async def notify_no_show_partner(waiting_user, absent_name: str, call_id: int) -> None:
-    """Notify a user that their match did not join the scheduled call."""
-    if not _push_enabled(waiting_user):
-        _no_token(waiting_user.name or "?", "no_show_partner")
-        return
-    await send_push(
-        token=waiting_user.device_token,
-        title="Your match didn't show up",
-        body=f"{absent_name} didn't join your video call. We've noted this on their account.",
-        data={
-            "type": "no_show_partner",
-            "absent_name": absent_name,
-            "call_id": call_id,
         },
     )
 

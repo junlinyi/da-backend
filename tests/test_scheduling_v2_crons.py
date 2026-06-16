@@ -174,6 +174,65 @@ async def test_expire_skips_young_locked(make_user, make_match, db):
 
 
 # ---------------------------------------------------------------------------
+# Task 9A-2 — notify_expiring_soon_matches (24h-before-expiry push)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_match_expiring_soon_fires_once_at_48h(make_user, make_match, db, monkeypatch):
+    """A locked/active/none match whose text_locked_at crossed 48h-elapsed within
+    the last tick fires match_expiring_soon once (to both participants)."""
+    import app.services.push_notification_service as push
+
+    calls = []
+
+    async def _counter(recipient, peer_name, match_id, **kw):
+        calls.append((recipient.id if recipient else None, match_id))
+
+    monkeypatch.setattr(push, "notify_match_expiring_soon", _counter)
+
+    a = await make_user(name="Al"); b = await make_user(name="Bo")
+    # 49h since lock -> crossed the 48h threshold ~1h ago. Within a 300s tick edge?
+    # The cron edge window is (now-48h-300s, now-48h]; 49h-ago is INSIDE neither —
+    # use a value that lands in the tick window: now - 48h - 1min.
+    m = await make_match(
+        a, b, text_state="locked", call_status="none", lifecycle="active",
+        text_locked_at=utc_now() - timedelta(hours=48, minutes=1),
+    )
+    await db.commit()
+
+    attempted = await mss.notify_expiring_soon_matches(db)
+    assert attempted == 1
+    # Pushed to BOTH participants for the one match.
+    assert len(calls) == 2
+    assert {c[1] for c in calls} == {m.id}
+    assert {c[0] for c in calls} == {a.id, b.id}
+
+
+@pytest.mark.asyncio
+async def test_match_expiring_soon_skips_recently_locked(make_user, make_match, db, monkeypatch):
+    """A match only 10h into its window must NOT fire match_expiring_soon."""
+    import app.services.push_notification_service as push
+
+    calls = []
+
+    async def _counter(recipient, peer_name, match_id, **kw):
+        calls.append(match_id)
+
+    monkeypatch.setattr(push, "notify_match_expiring_soon", _counter)
+
+    a = await make_user(name="Al"); b = await make_user(name="Bo")
+    m = await make_match(
+        a, b, text_state="locked", call_status="none", lifecycle="active",
+        text_locked_at=utc_now() - timedelta(hours=10),
+    )
+    await db.commit()
+
+    attempted = await mss.notify_expiring_soon_matches(db)
+    assert attempted == 0
+    assert calls == []
+
+
+# ---------------------------------------------------------------------------
 # Task 6.3 — detect_no_shows
 # ---------------------------------------------------------------------------
 

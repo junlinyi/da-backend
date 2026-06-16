@@ -79,7 +79,8 @@ async def test_mask_mirrored_to_postgres(db, make_user):
     assert masked is True
 
     await create_message_in_postgresql(
-        str(conv.id), a.id, masked_content, "text", db, has_masked_content=masked,
+        sender_id=a.id, recipient_id=b.id, content=masked_content,
+        message_type="text", db=db, has_masked_content=masked,
     )
 
     row = (await db.execute(
@@ -88,6 +89,62 @@ async def test_mask_mirrored_to_postgres(db, make_user):
     assert "[phone hidden]" in row.content
     assert "555-123-4567" not in row.content
     assert row.has_masked_content is True
+
+
+# ---------------------------------------------------------------------------
+# Task 9A-3 — message mirror resolves the PG Conversation by participant PAIR
+# (previously a silent no-op because it matched Conversation.id against the
+# Firestore string doc id). Proves a mirror row is written with correct fields.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_mirror_resolves_conversation_by_pair(db, make_user):
+    a = await make_user(name="A")
+    b = await make_user(name="B")
+    conv = models.Conversation(user1_id=a.id, user2_id=b.id)
+    db.add(conv)
+    await db.commit()
+    await db.refresh(conv)
+
+    await create_message_in_postgresql(
+        sender_id=a.id, recipient_id=b.id, content="hi there",
+        message_type="text", db=db, has_masked_content=False,
+    )
+
+    row = (await db.execute(
+        select(models.Message).where(models.Message.conversation_id == conv.id)
+    )).scalar_one()
+    assert row.conversation_id == conv.id  # resolved the EXISTING pair conversation
+    assert row.sender_id == a.id
+    assert row.content == "hi there"
+    assert row.message_type == "text"
+    assert row.has_masked_content is False
+
+
+@pytest.mark.asyncio
+async def test_mirror_creates_conversation_when_missing(db, make_user):
+    """If no PG Conversation exists for the pair yet, the mirror creates one
+    rather than silently dropping the row."""
+    a = await make_user(name="A")
+    b = await make_user(name="B")
+    # No Conversation row created up front.
+
+    await create_message_in_postgresql(
+        sender_id=a.id, recipient_id=b.id, content="first message",
+        message_type="text", db=db, has_masked_content=False,
+    )
+
+    conv = (await db.execute(
+        select(models.Conversation).where(
+            ((models.Conversation.user1_id == a.id) & (models.Conversation.user2_id == b.id))
+            | ((models.Conversation.user1_id == b.id) & (models.Conversation.user2_id == a.id))
+        )
+    )).scalar_one()
+    row = (await db.execute(
+        select(models.Message).where(models.Message.conversation_id == conv.id)
+    )).scalar_one()
+    assert row.sender_id == a.id
+    assert row.content == "first message"
 
 
 # ---------------------------------------------------------------------------

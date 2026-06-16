@@ -419,6 +419,44 @@ async def expire_unscheduled_matches(db: AsyncSession) -> int:
     return expired
 
 
+async def notify_expiring_soon_matches(db: AsyncSession) -> int:
+    """Best-effort 'match_expiring_soon' push, 24h before a match expires.
+
+    A locked/active match expires 72h after text_locked_at (the proposal window).
+    "24h remaining" therefore means text_locked_at crossed the 48h-elapsed mark.
+    We push to matches that are still uncommitted — call_status IN ('none',
+    'no_show') — exactly as expire_unscheduled_matches selects them.
+
+    Dedup: this runs in the 300s slow loop, so a match would otherwise satisfy a
+    plain `text_locked_at < now-48h` predicate on every tick for the remaining
+    24h. Mirroring notify_text_window_nudges, we restrict the fire to a single
+    tick-width window: text_locked_at must have crossed the 48h threshold within
+    the last tick, i.e. text_locked_at ∈ (now-48h-300s, now-48h]. Each match
+    therefore fires at most once. If a tick is missed the nudge is simply skipped
+    (best-effort), never re-sent. Returns the number of pushes attempted.
+    """
+    now = utc_now()
+    tick = timedelta(seconds=300)
+    # 24h-remaining: elapsed-since-lock crossed 48h within the last tick.
+    edge_hi = now - timedelta(hours=PROPOSAL_WINDOW_HOURS - 24)  # 72 - 24 = 48h
+    edge_lo = edge_hi - tick
+    rows = (await db.execute(
+        select(models.Match).where(
+            models.Match.text_state == "locked",
+            models.Match.lifecycle == "active",
+            models.Match.call_status.in_(["none", "no_show"]),
+            models.Match.text_locked_at > edge_lo,
+            models.Match.text_locked_at <= edge_hi,
+        )
+    )).scalars().all()
+
+    attempted = 0
+    for m in rows:
+        await _push_both_participants(db, m, "notify_match_expiring_soon")
+        attempted += 1
+    return attempted
+
+
 async def detect_no_shows(db: AsyncSession) -> int:
     """Mark past scheduled calls as no_show when fewer than 2 users joined.
 

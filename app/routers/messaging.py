@@ -301,6 +301,7 @@ async def send_message(
         # -> Match between the two backend user ids. ---
         other_uid = next((uid for uid in participants if uid != current_user_firebase_uid), None)
         v2_match = None
+        other_user_for_match = None
         if other_uid:
             other_user_q = await db.execute(select(User).where(User.firebase_uid == other_uid))
             other_user_for_match = other_user_q.scalar_one_or_none()
@@ -332,15 +333,18 @@ async def send_message(
             'lastMessageTime': firestore.SERVER_TIMESTAMP
         })
 
-        # Also create message in PostgreSQL for analytics (masked content + flag)
-        await create_message_in_postgresql(
-            conversation_id,
-            current_user.id,
-            outgoing_content,
-            message.message_type or 'text',
-            db,
-            has_masked_content=masked,
-        )
+        # Also create message in PostgreSQL for analytics (masked content + flag).
+        # Resolve the PG Conversation by the participant PAIR (sender + recipient),
+        # not the Firestore string id — see create_message_in_postgresql.
+        if other_user_for_match is not None:
+            await create_message_in_postgresql(
+                sender_id=current_user.id,
+                recipient_id=other_user_for_match.id,
+                content=outgoing_content,
+                message_type=message.message_type or 'text',
+                db=db,
+                has_masked_content=masked,
+            )
 
         # D2 — notify the recipient of the new message (best-effort, fire-and-forget)
         try:
@@ -427,46 +431,66 @@ async def mark_messages_as_read_firebase(conversation_id: str, user_firebase_uid
         pass
 
 async def create_message_in_postgresql(
-    conversation_id: str,
     sender_id: int,
+    recipient_id: int,
     content: str,
     message_type: str,
     db: AsyncSession,
     has_masked_content: bool = False,
 ):
-    """
-    Create message in PostgreSQL for analytics purposes
+    """Mirror a chat message into Postgres for analytics/ML.
+
+    HISTORY / BUGFIX (Task 9A-3): this helper previously took the Firestore
+    conversation doc id (a STRING) and tried `Conversation.id == int(...)`. But
+    the Firestore doc id is unrelated to the Postgres `Conversation.id` (int PK),
+    so the lookup never matched and the mirror was a silent no-op (an earlier
+    guard skipped non-numeric ids to avoid poisoning the transaction).
+
+    Postgres `Conversation` rows DO exist for every chat — they're created by the
+    participant PAIR (user1_id/user2_id) in match_creation.py and
+    firebase_sync_service.py. So we resolve the conversation the same way every
+    other module does: by the (sender, recipient) pair in either order. If no row
+    exists yet (e.g. a chat that predates the PG sync), we create one so the
+    mirror is never silently dropped.
     """
     try:
-        # The incoming id is a Firestore doc id (string). Conversation.id is an
-        # int PK, so only attempt the lookup when the id is numeric — otherwise a
-        # non-int comparison would abort the transaction (and never match anyway).
-        if not str(conversation_id).isdigit():
-            return
-        # Find the PostgreSQL conversation ID
+        # Resolve the Postgres Conversation by participant pair (either order).
         result = await db.execute(
-            select(Conversation).where(Conversation.id == int(conversation_id))
+            select(Conversation).where(
+                or_(
+                    (Conversation.user1_id == sender_id) & (Conversation.user2_id == recipient_id),
+                    (Conversation.user1_id == recipient_id) & (Conversation.user2_id == sender_id),
+                )
+            )
         )
         pg_conversation = result.scalar_one_or_none()
 
-        if pg_conversation:
-            # Create message in PostgreSQL
-            new_message = Message(
-                conversation_id=pg_conversation.id,
-                sender_id=sender_id,
-                content=content,
-                message_type=message_type,
-                timestamp=datetime.now(timezone.utc),
-                has_masked_content=has_masked_content,
-                firebase_id=conversation_id  # Store Firebase conversation ID for reference
-            )
-            db.add(new_message)
-            await db.commit()
+        # No PG conversation row for this pair yet — create one so the analytics
+        # mirror is consistent with how conversations are created elsewhere.
+        if pg_conversation is None:
+            pg_conversation = Conversation(user1_id=sender_id, user2_id=recipient_id)
+            db.add(pg_conversation)
+            await db.flush()
+
+        # Create the mirror message. `firebase_id` is left NULL — it is meant for
+        # a per-MESSAGE Firebase id (and is UNIQUE), not the conversation id; we
+        # don't receive the message id here, and stamping the conversation id on
+        # every row would violate the unique constraint after the first message.
+        new_message = Message(
+            conversation_id=pg_conversation.id,
+            sender_id=sender_id,
+            content=content,
+            message_type=message_type,
+            timestamp=datetime.now(timezone.utc),
+            has_masked_content=has_masked_content,
+        )
+        db.add(new_message)
+        await db.commit()
 
     except Exception as e:
-        # Error creating message in PostgreSQL
-        # Don't fail the main operation if PostgreSQL sync fails
-        pass
+        # Don't fail the main (Firebase) operation if the PG mirror fails.
+        logger.warning(f"create_message_in_postgresql mirror failed: {e}")
+        await db.rollback()
 
 async def mark_messages_as_read(conversation_id: int, user_id: int, db: AsyncSession):
     """
