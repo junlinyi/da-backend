@@ -94,7 +94,7 @@ async def setup_database(request):
     detected via the `db` fixture, so the broken SQLite ARRAY setup never runs
     for those tests.
     """
-    if "db" in request.fixturenames:
+    if "db" in request.fixturenames or request.node.get_closest_marker("nodb"):
         yield
         return
     test_db = request.getfixturevalue("test_db")
@@ -216,7 +216,7 @@ async def cleanup_after_test(request):
     Skipped for Postgres-harness tests (those that use the `db` fixture), which
     manage their own teardown.
     """
-    if "db" in request.fixturenames:
+    if "db" in request.fixturenames or request.node.get_closest_marker("nodb"):
         yield
         return
     test_db = request.getfixturevalue("test_db")
@@ -237,6 +237,7 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "regression: Regression tests")
     config.addinivalue_line("markers", "performance: Performance tests")
     config.addinivalue_line("markers", "slow: Slow running tests")
+    config.addinivalue_line("markers", "nodb: Pure unit tests needing no database harness")
 
 
 # Test collection customization
