@@ -61,7 +61,7 @@ from app.routers import auth, users, matchmaking, sync, messaging, scheduling, v
 from app.routers import questionnaire
 from app.routers import matches
 from app.services.firebase_sync_service import start_background_sync, stop_background_sync
-from app.services.scheduling_monitor_service import start_scheduling_monitor, stop_scheduling_monitor
+from app.services.scheduling_monitor_service import start_scheduling_monitor, stop_scheduling_monitor, start_fast_monitor
 
 # ── Sentry error tracking (INFRA-05) ─────────────────────────────────────────
 # Set SENTRY_DSN in .env to enable. Safe to leave unset in development.
@@ -190,8 +190,11 @@ async def startup_event():
     # Start Firebase sync service
     asyncio.create_task(start_background_sync())
 
-    # Start scheduling monitor service
+    # Start scheduling monitor service (slow loop: expiry + no-show, 300s)
     asyncio.create_task(start_scheduling_monitor())
+
+    # Start the fast scheduling loop (text-lock + pre-lock nudges, 60s)
+    asyncio.create_task(start_fast_monitor())
 
 @app.on_event("shutdown")
 async def shutdown_event():

@@ -87,6 +87,7 @@ def compute_match_card_display(text_state: str, call_status: str, lifecycle: str
 PROPOSAL_WINDOW_HOURS = 72
 TEXT_WINDOW_HOURS = 24
 DATE_DURATION_MIN = 30
+NO_SHOW_GRACE_MIN = 10
 
 
 async def _lock_match(db: AsyncSession, match_id: int) -> models.Match:
@@ -257,6 +258,189 @@ async def write_system_message(db: AsyncSession, match: "models.Match",
         })
     except Exception as exc:  # noqa: BLE001 — best-effort mirror
         logger.warning("write_system_message: Firestore write failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Phase 6 — time-based cron BODIES
+#
+# Each body manages its OWN per-iteration error handling so one bad row can't
+# abort the whole tick, but leaves the final commit to the caller (the loop in
+# scheduling_monitor_service.py calls each with a fresh session and commits
+# after). Push sends are best-effort and Phase 7 (Task 7.1) — guarded by
+# hasattr + try/except so tests never depend on push being implemented.
+# ---------------------------------------------------------------------------
+
+
+async def _try_push(fn_name: str, **kwargs) -> None:
+    """Best-effort V2 push dispatch. The concrete senders land in Task 7.1; until
+    then this is a no-op guarded so a missing attribute or any failure is swallowed.
+    """
+    try:  # TODO(Task 7.1): wire concrete V2 push senders.
+        from app.services import push_notification_service as push
+        fn = getattr(push, fn_name, None)
+        if fn is None:
+            return
+        await fn(**kwargs)
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        logger.warning("best-effort push %s failed: %s", fn_name, exc)
+
+
+async def lock_text_for_eligible_matches(db: AsyncSession) -> int:
+    """Lock text for matches whose 24h window elapsed. Returns count locked.
+
+    Selects matches where text_state='open' AND lifecycle='active' AND
+    created_at < now - 24h. For each: text_state='locked', text_locked_at=now,
+    expires_at=now+72h. If call_status='none', writes a 'text_locked' system
+    message + best-effort push (skipped when a date is already scheduled).
+    """
+    now = utc_now()
+    cutoff = now - timedelta(hours=TEXT_WINDOW_HOURS)
+    rows = (await db.execute(
+        select(models.Match).where(
+            models.Match.text_state == "open",
+            models.Match.lifecycle == "active",
+            models.Match.created_at < cutoff,
+        )
+    )).scalars().all()
+
+    locked = 0
+    for m in rows:
+        try:
+            m.text_state = "locked"
+            m.text_locked_at = now
+            m.expires_at = now + timedelta(hours=PROPOSAL_WINDOW_HOURS)
+            await db.flush()
+            # Only nudge if no date is committed yet (spec §Service Logic).
+            if m.call_status == "none":
+                await write_system_message(
+                    db, m, "text_locked",
+                    "Text paused. Schedule your video date to take it to the next level.",
+                )
+                await _try_push("notify_text_locked", match_id=m.id)
+            locked += 1
+        except Exception as exc:  # noqa: BLE001 — isolate one bad row
+            logger.error("lock_text_for_eligible_matches failed for match %s: %s",
+                         m.id, exc, exc_info=True)
+            continue
+    return locked
+
+
+async def notify_text_window_nudges(db: AsyncSession) -> int:
+    """Best-effort pre-lock nudges. Returns number of pushes attempted.
+
+    Fires text_window_5h_remaining at ~19h elapsed (5h remaining) and
+    text_window_locking at ~23h elapsed (1h remaining), for open/active matches
+    with call_status='none'.
+
+    Dedup: this loop runs every 60s, so each match would otherwise match the
+    "19h elapsed" predicate for a full hour (60 ticks). We restrict each nudge
+    to a 1-tick-wide window (the slice of `created_at` that crosses the threshold
+    within the last 60s) so each match fires at most once per threshold. This is
+    a best-effort approximation — if a tick is missed the nudge is simply skipped
+    rather than re-sent on the next tick.
+    """
+    now = utc_now()
+    tick = timedelta(seconds=60)
+    attempted = 0
+
+    # 5h-remaining: elapsed crossed 19h within the last tick, i.e.
+    # created_at fell into (now-19h-60s, now-19h].
+    edge_5h_hi = now - timedelta(hours=19)
+    edge_5h_lo = edge_5h_hi - tick
+    # 1h-remaining: elapsed crossed 23h within the last tick.
+    edge_1h_hi = now - timedelta(hours=23)
+    edge_1h_lo = edge_1h_hi - tick
+
+    for push_name, lo, hi in (
+        ("notify_text_window_5h_remaining", edge_5h_lo, edge_5h_hi),
+        ("notify_text_window_locking", edge_1h_lo, edge_1h_hi),
+    ):
+        rows = (await db.execute(
+            select(models.Match).where(
+                models.Match.text_state == "open",
+                models.Match.lifecycle == "active",
+                models.Match.call_status == "none",
+                models.Match.created_at > lo,
+                models.Match.created_at <= hi,
+            )
+        )).scalars().all()
+        for m in rows:
+            await _try_push(push_name, match_id=m.id)
+            attempted += 1
+    return attempted
+
+
+async def expire_unscheduled_matches(db: AsyncSession) -> int:
+    """Expire locked matches whose 72h proposal window elapsed with no commitment.
+
+    Selects matches where text_state='locked' AND lifecycle='active' AND
+    call_status IN ('none','no_show') AND text_locked_at < now - 72h. For each:
+    lifecycle='expired', text_state='archived'. Matches with call_status in
+    {scheduled,in_progress,pending_survey,completed} are protected (they
+    committed). Returns count expired.
+    """
+    now = utc_now()
+    cutoff = now - timedelta(hours=PROPOSAL_WINDOW_HOURS)
+    rows = (await db.execute(
+        select(models.Match).where(
+            models.Match.text_state == "locked",
+            models.Match.lifecycle == "active",
+            models.Match.call_status.in_(["none", "no_show"]),
+            models.Match.text_locked_at < cutoff,
+        )
+    )).scalars().all()
+
+    expired = 0
+    for m in rows:
+        try:
+            m.lifecycle = "expired"
+            m.text_state = "archived"
+            await db.flush()
+            await _try_push("notify_match_expired_unscheduled", match_id=m.id)
+            expired += 1
+        except Exception as exc:  # noqa: BLE001 — isolate one bad row
+            logger.error("expire_unscheduled_matches failed for match %s: %s",
+                         m.id, exc, exc_info=True)
+            continue
+    return expired
+
+
+async def detect_no_shows(db: AsyncSession) -> int:
+    """Mark past scheduled calls as no_show when fewer than 2 users joined.
+
+    Selects ScheduledCall where status='scheduled' AND
+    scheduled_start_utc + 10min < now AND NOT (user1_joined AND user2_joined).
+    For each, derives non-joiner ids from the join flags and calls record_no_show
+    (which logs events, bumps counters, applies 2-strikes termination). Returns
+    the number of calls processed.
+    """
+    now = utc_now()
+    cutoff = now - timedelta(minutes=NO_SHOW_GRACE_MIN)
+    rows = (await db.execute(
+        select(models.ScheduledCall).where(
+            models.ScheduledCall.status == "scheduled",
+            models.ScheduledCall.scheduled_start_utc < cutoff,
+            ~(models.ScheduledCall.user1_joined & models.ScheduledCall.user2_joined),
+        )
+    )).scalars().all()
+
+    processed = 0
+    for call in rows:
+        try:
+            non_joiners = []
+            if not call.user1_joined:
+                non_joiners.append(call.user1_id)
+            if not call.user2_joined:
+                non_joiners.append(call.user2_id)
+            if not non_joiners:
+                continue
+            await record_no_show(db, call, non_joiners)
+            processed += 1
+        except Exception as exc:  # noqa: BLE001 — isolate one bad row
+            logger.error("detect_no_shows failed for call %s: %s",
+                         call.id, exc, exc_info=True)
+            continue
+    return processed
 
 
 async def process_exit_survey(db: AsyncSession, match_id: int, user_id: int, response: bool) -> models.Match:
