@@ -517,23 +517,29 @@ def _parse_start_utc(raw: datetime) -> datetime:
     return start
 
 
-async def _notify_peer_best_effort(db: AsyncSession, peer_user_id: int, sender: User, kind: str, ref_id: int):
-    """Best-effort push to the peer. Can NEVER raise; swallows everything.
+async def _notify_peer_best_effort(
+    db: AsyncSession, peer_user_id: int, sender: User, kind: str, match_id: int,
+    when: str = "",
+):
+    """Best-effort proposal-lifecycle push to the peer. Can NEVER raise.
 
-    TODO(Task 7.1): replace with the V2 typed notify_* senders (built in Phase 7)
-    using the exact copy from the spec. For now we opportunistically call an
-    existing push_notification_service function if a reasonable one exists.
+    Wires the V2 typed senders (Task 7.1). `sender` is the actor; `peer` is the
+    recipient. `when` is a pre-formatted human time string for the date.
     """
     try:
         peer = (await db.execute(select(User).where(User.id == peer_user_id))).scalar_one_or_none()
         if peer is None:
             return
-        if kind == "proposal" and hasattr(push, "notify_proposal_received"):
-            await push.notify_proposal_received(recipient=peer, proposer=sender, proposal_id=ref_id)
-        elif kind == "accepted" and hasattr(push, "notify_proposal_accepted"):
-            await push.notify_proposal_accepted(proposer=peer, accepter=sender, call_id=ref_id)
-        elif kind == "counter" and hasattr(push, "notify_counter_proposal_received"):
-            await push.notify_counter_proposal_received(recipient=peer, proposer=sender, proposal_id=ref_id)
+        peer_name = sender.name or "Your match"
+        if kind == "proposal":
+            await push.notify_proposal_received(
+                recipient=peer, peer_name=peer_name, match_id=match_id, when=when)
+        elif kind == "accepted":
+            await push.notify_proposal_accepted(
+                recipient=peer, peer_name=peer_name, match_id=match_id, when=when)
+        elif kind == "counter":
+            await push.notify_counter_proposal_received(
+                recipient=peer, peer_name=peer_name, match_id=match_id, when=when)
     except Exception as exc:  # pragma: no cover - best-effort, never break the endpoint
         logger.warning(f"[PUSH] best-effort {kind} notify failed: {exc}")
 
@@ -610,7 +616,8 @@ async def propose_call(
     await db.refresh(proposal)
 
     peer_id = m.matched_user_id if m.user_id == user.id else m.user_id
-    await _notify_peer_best_effort(db, peer_id, user, "proposal", proposal.id)
+    await _notify_peer_best_effort(
+        db, peer_id, user, "proposal", m.id, when=start.strftime("%a %-I %p"))
 
     return proposal
 
@@ -725,7 +732,9 @@ async def accept_proposal(
     await db.refresh(user1)
     await db.refresh(user2)
 
-    await _notify_peer_best_effort(db, proposal.proposer_user_id, user, "accepted", call.id)
+    await _notify_peer_best_effort(
+        db, proposal.proposer_user_id, user, "accepted", m.id,
+        when=call.scheduled_start_utc.strftime("%a %-I %p"))
 
     return _build_scheduled_call_response(call, user, user1, user2)
 
@@ -790,7 +799,9 @@ async def counter_proposal(
     await db.commit()
     await db.refresh(new_proposal)
 
-    await _notify_peer_best_effort(db, proposal.proposer_user_id, user, "counter", new_proposal.id)
+    await _notify_peer_best_effort(
+        db, proposal.proposer_user_id, user, "counter", m.id,
+        when=start.strftime("%a %-I %p"))
 
     return new_proposal
 
@@ -1670,10 +1681,22 @@ async def mark_call_no_show(
     res = await mss.record_no_show(db, call, non_joiner_ids)
     await db.commit()
 
-    # Best-effort push (TODO Task 7.1): date_no_show_reschedule if not terminated,
-    # match_terminated_no_show if terminated. No hard dependency.
+    # Best-effort push: date_no_show_reschedule if not terminated,
+    # match_terminated_no_show if terminated. Sent to both participants.
     try:
-        pass  # TODO(7.1): wire push notifications for no-show / termination.
+        u1 = (await db.execute(select(User).where(User.id == call.user1_id))).scalar_one_or_none()
+        u2 = (await db.execute(select(User).where(User.id == call.user2_id))).scalar_one_or_none()
+        terminated = res["match_terminated"]
+        for recipient, peer in ((u1, u2), (u2, u1)):
+            if recipient is None:
+                continue
+            peer_name = (peer.name if peer else None) or "your match"
+            if terminated:
+                await push.notify_match_terminated_no_show(
+                    recipient=recipient, peer_name=peer_name, match_id=call.match_id)
+            else:
+                await push.notify_date_no_show_reschedule(
+                    recipient=recipient, peer_name=peer_name, match_id=call.match_id)
     except Exception:
         logger.exception("no-show push notification failed (non-fatal)")
 

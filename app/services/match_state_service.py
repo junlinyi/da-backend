@@ -271,16 +271,30 @@ async def write_system_message(db: AsyncSession, match: "models.Match",
 # ---------------------------------------------------------------------------
 
 
-async def _try_push(fn_name: str, **kwargs) -> None:
-    """Best-effort V2 push dispatch. The concrete senders land in Task 7.1; until
-    then this is a no-op guarded so a missing attribute or any failure is swallowed.
+async def _push_both_participants(db: AsyncSession, match: "models.Match",
+                                  fn_name: str, **extra) -> None:
+    """Best-effort V2 push to BOTH participants of a match (Task 7.1).
+
+    Resolves both Users, then calls push.<fn_name>(recipient=..., peer_name=...,
+    match_id=match.id, **extra) once per recipient (peer_name = the OTHER user's
+    name). Any failure is swallowed so a cron tick is never broken by push.
     """
-    try:  # TODO(Task 7.1): wire concrete V2 push senders.
+    try:
         from app.services import push_notification_service as push
         fn = getattr(push, fn_name, None)
         if fn is None:
             return
-        await fn(**kwargs)
+        a = (await db.execute(
+            select(models.User).where(models.User.id == match.user_id)
+        )).scalar_one_or_none()
+        b = (await db.execute(
+            select(models.User).where(models.User.id == match.matched_user_id)
+        )).scalar_one_or_none()
+        for recipient, peer in ((a, b), (b, a)):
+            if recipient is None:
+                continue
+            peer_name = (peer.name if peer else None) or "your match"
+            await fn(recipient=recipient, peer_name=peer_name, match_id=match.id, **extra)
     except Exception as exc:  # noqa: BLE001 — best-effort
         logger.warning("best-effort push %s failed: %s", fn_name, exc)
 
@@ -316,7 +330,7 @@ async def lock_text_for_eligible_matches(db: AsyncSession) -> int:
                     db, m, "text_locked",
                     "Text paused. Schedule your video date to take it to the next level.",
                 )
-                await _try_push("notify_text_locked", match_id=m.id)
+                await _push_both_participants(db, m, "notify_text_locked")
             locked += 1
         except Exception as exc:  # noqa: BLE001 — isolate one bad row
             logger.error("lock_text_for_eligible_matches failed for match %s: %s",
@@ -365,7 +379,7 @@ async def notify_text_window_nudges(db: AsyncSession) -> int:
             )
         )).scalars().all()
         for m in rows:
-            await _try_push(push_name, match_id=m.id)
+            await _push_both_participants(db, m, push_name)
             attempted += 1
     return attempted
 
@@ -396,7 +410,7 @@ async def expire_unscheduled_matches(db: AsyncSession) -> int:
             m.lifecycle = "expired"
             m.text_state = "archived"
             await db.flush()
-            await _try_push("notify_match_expired_unscheduled", match_id=m.id)
+            await _push_both_participants(db, m, "notify_match_expired_unscheduled")
             expired += 1
         except Exception as exc:  # noqa: BLE001 — isolate one bad row
             logger.error("expire_unscheduled_matches failed for match %s: %s",
@@ -434,13 +448,84 @@ async def detect_no_shows(db: AsyncSession) -> int:
                 non_joiners.append(call.user2_id)
             if not non_joiners:
                 continue
-            await record_no_show(db, call, non_joiners)
+            res = await record_no_show(db, call, non_joiners)
+            # Best-effort push to both participants (terminated vs reschedule).
+            m = (await db.execute(
+                select(models.Match).where(models.Match.id == call.match_id)
+            )).scalar_one_or_none()
+            if m is not None:
+                fn = ("notify_match_terminated_no_show" if res["match_terminated"]
+                      else "notify_date_no_show_reschedule")
+                await _push_both_participants(db, m, fn)
             processed += 1
         except Exception as exc:  # noqa: BLE001 — isolate one bad row
             logger.error("detect_no_shows failed for call %s: %s",
                          call.id, exc, exc_info=True)
             continue
     return processed
+
+
+async def send_date_reminders(db: AsyncSession) -> int:
+    """Push date reminders for upcoming scheduled calls (slow 300s cron).
+
+    Two reminders per call:
+    - date_starting_soon: ~15 min before start. Deduped via ScheduledCall.
+      reminder_sent (set True after sending), so it fires at most once.
+    - date_starting_now: at start time. Deduped to a single tick-width window
+      (start within the last 300s) so the 5-min cron fires it at most once.
+
+    Both go to both participants. Returns the number of reminders attempted.
+    """
+    now = utc_now()
+    tick = timedelta(seconds=300)
+    attempted = 0
+
+    # --- 15-min "starting soon" reminder (dedup via reminder_sent) ----------
+    soon_rows = (await db.execute(
+        select(models.ScheduledCall).where(
+            models.ScheduledCall.status == "scheduled",
+            models.ScheduledCall.reminder_sent.is_(False),
+            models.ScheduledCall.scheduled_start_utc > now,
+            models.ScheduledCall.scheduled_start_utc <= now + timedelta(minutes=15),
+        )
+    )).scalars().all()
+    for call in soon_rows:
+        try:
+            m = (await db.execute(
+                select(models.Match).where(models.Match.id == call.match_id)
+            )).scalar_one_or_none()
+            if m is not None:
+                await _push_both_participants(db, m, "notify_date_starting_soon", minutes=15)
+                attempted += 1
+            call.reminder_sent = True
+            await db.flush()
+        except Exception as exc:  # noqa: BLE001 — isolate one bad row
+            logger.error("send_date_reminders (soon) failed for call %s: %s",
+                         call.id, exc, exc_info=True)
+            continue
+
+    # --- "starting now" reminder (dedup via tick-width window) --------------
+    now_rows = (await db.execute(
+        select(models.ScheduledCall).where(
+            models.ScheduledCall.status == "scheduled",
+            models.ScheduledCall.scheduled_start_utc > now - tick,
+            models.ScheduledCall.scheduled_start_utc <= now,
+        )
+    )).scalars().all()
+    for call in now_rows:
+        try:
+            m = (await db.execute(
+                select(models.Match).where(models.Match.id == call.match_id)
+            )).scalar_one_or_none()
+            if m is not None:
+                await _push_both_participants(db, m, "notify_date_starting_now")
+                attempted += 1
+        except Exception as exc:  # noqa: BLE001 — isolate one bad row
+            logger.error("send_date_reminders (now) failed for call %s: %s",
+                         call.id, exc, exc_info=True)
+            continue
+
+    return attempted
 
 
 async def process_exit_survey(db: AsyncSession, match_id: int, user_id: int, response: bool) -> models.Match:

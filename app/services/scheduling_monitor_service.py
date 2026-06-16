@@ -84,6 +84,7 @@ class SchedulingMonitorService:
             try:
                 await mss.expire_unscheduled_matches(db)
                 await mss.detect_no_shows(db)
+                await mss.send_date_reminders(db)
                 await db.commit()
             except Exception as e:
                 logger.error(f"[MONITOR] Error in check_all_matches tick: {e}", exc_info=True)

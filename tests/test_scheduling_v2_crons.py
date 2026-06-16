@@ -243,3 +243,59 @@ async def test_detect_no_shows_both_joined_untouched(make_user, make_match, db):
     await db.refresh(call); await db.refresh(m)
     assert call.status == "scheduled"
     assert m.call_status == "scheduled"
+
+
+# ---------------------------------------------------------------------------
+# Task 7.2 — send_date_reminders
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_date_reminder_15min_sets_reminder_sent(make_user, make_match, db):
+    a = await make_user(name="Al"); b = await make_user(name="Bo")
+    m = await make_match(a, b, call_status="scheduled")
+    start = utc_now() + timedelta(minutes=10)  # within 15-min window
+    call = await _make_call(
+        db, m, a, b, scheduled_start_utc=start,
+        scheduled_end_utc=start + timedelta(minutes=30),
+    )
+    assert call.reminder_sent is False
+
+    attempted = await mss.send_date_reminders(db)
+    await db.commit()
+    await db.refresh(call)
+    assert attempted >= 1
+    assert call.reminder_sent is True
+
+    # Second tick must NOT re-send the 15-min reminder (deduped).
+    assert await mss.send_date_reminders(db) == 0
+
+
+@pytest.mark.asyncio
+async def test_date_reminder_future_untouched(make_user, make_match, db):
+    a = await make_user(name="Al"); b = await make_user(name="Bo")
+    m = await make_match(a, b, call_status="scheduled")
+    start = utc_now() + timedelta(hours=3)  # too far out
+    call = await _make_call(
+        db, m, a, b, scheduled_start_utc=start,
+        scheduled_end_utc=start + timedelta(minutes=30),
+    )
+
+    assert await mss.send_date_reminders(db) == 0
+    await db.refresh(call)
+    assert call.reminder_sent is False
+
+
+@pytest.mark.asyncio
+async def test_date_reminder_starting_now(make_user, make_match, db):
+    a = await make_user(name="Al"); b = await make_user(name="Bo")
+    m = await make_match(a, b, call_status="scheduled")
+    start = utc_now() - timedelta(seconds=30)  # just started, within tick window
+    call = await _make_call(
+        db, m, a, b, scheduled_start_utc=start,
+        scheduled_end_utc=start + timedelta(minutes=30),
+        reminder_sent=True,  # 15-min already sent earlier
+    )
+
+    # Should fire the "starting now" reminder (does not depend on reminder_sent).
+    attempted = await mss.send_date_reminders(db)
+    assert attempted >= 1

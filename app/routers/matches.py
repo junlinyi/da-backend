@@ -13,6 +13,7 @@ from app.database import get_db
 from app.dependencies import get_current_user
 from app.models import Match, User
 from app.services import match_state_service as mss
+from app.services import push_notification_service as push
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,46 @@ async def _load_participant_match(db: AsyncSession, match_id: int, user_id: int)
     if user_id not in (m.user_id, m.matched_user_id):
         raise HTTPException(status_code=403, detail="Not a match participant")
     return m
+
+
+async def _notify_exit_survey(db: AsyncSession, m: Match, responder_id: int, response: bool) -> None:
+    """Best-effort exit-survey pushes based on the post-write survey state.
+
+    - both yes  -> text_unlocked_mutual_yes to both
+    - one yes, other not responded -> partner_responded_yes to the non-responder
+    - any no    -> match_terminated_survey_no to both (asymmetric)
+    """
+    a_id, b_id = m.user_id, m.matched_user_id
+    user_a = (await db.execute(select(User).where(User.id == a_id))).scalar_one_or_none()
+    user_b = (await db.execute(select(User).where(User.id == b_id))).scalar_one_or_none()
+    if user_a is None or user_b is None:
+        return
+    a_resp = m.exit_survey_user_a_response  # user_a == m.user_id
+    b_resp = m.exit_survey_user_b_response
+
+    def name_of(u) -> str:
+        return (u.name if u else None) or "your match"
+
+    if a_resp is False or b_resp is False:
+        # Either user said no -> terminated. Asymmetric copy by who just responded "no".
+        for recipient, peer in ((user_a, user_b), (user_b, user_a)):
+            is_no_er = (recipient.id == responder_id and response is False)
+            await push.notify_match_terminated_survey_no(
+                recipient=recipient, peer_name=name_of(peer),
+                match_id=m.id, is_no_er=is_no_er)
+    elif a_resp is True and b_resp is True:
+        # Both yes -> mutual unlock, notify both.
+        for recipient, peer in ((user_a, user_b), (user_b, user_a)):
+            await push.notify_text_unlocked_mutual_yes(
+                recipient=recipient, peer_name=name_of(peer), match_id=m.id)
+    else:
+        # Exactly one "yes" recorded so far -> nudge the non-responder.
+        if a_resp is True and b_resp is None:
+            await push.notify_partner_responded_yes(
+                recipient=user_b, peer_name=name_of(user_a), match_id=m.id)
+        elif b_resp is True and a_resp is None:
+            await push.notify_partner_responded_yes(
+                recipient=user_a, peer_name=name_of(user_b), match_id=m.id)
 
 
 @router.post("/{match_id}/exit-survey", response_model=schemas.ExitSurveyResultResponse)
@@ -54,10 +95,11 @@ async def submit_exit_survey(
         raise
     await db.commit()
 
-    # Best-effort push (TODO Task 7.1): both-yes -> text_unlocked_mutual_yes,
-    # one-yes-other-none -> partner_responded_yes, any-no -> match_terminated_survey_no.
+    # Best-effort push: both-yes -> text_unlocked_mutual_yes (both),
+    # one-yes-other-none -> partner_responded_yes (non-responder),
+    # any-no -> match_terminated_survey_no (both, asymmetric copy).
     try:
-        pass  # TODO(7.1): wire exit-survey push notifications.
+        await _notify_exit_survey(db, m, responder_id=user.id, response=body.response)
     except Exception:
         logger.exception("exit-survey push notification failed (non-fatal)")
 
