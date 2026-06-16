@@ -10,9 +10,12 @@ from datetime import datetime, time, timedelta, timezone
 from app.database import get_db
 from app.models import (
     User, UserSchedulingPreferences, ScheduledCall, Match,
-    SchedulingProposal, ProposalTimeSlot,
-    ProposalResponse, CounterProposalTimeSlot, MatchOutcome
+    MatchOutcome
 )
+# NOTE(v2): Legacy proposal/call-request models (SchedulingProposal, ProposalTimeSlot,
+# ProposalResponse, CounterProposalTimeSlot, CallRequest) were removed in Task 1.1.
+# The endpoints below that still reference them are dead and will be deleted in Task 9.1;
+# they only NameError if invoked, not at import.
 from app.schemas import (
     UserSchedulingPreferenceCreate, UserSchedulingPreferenceResponse,
     ScheduledCallCreate, ScheduledCallResponse,
