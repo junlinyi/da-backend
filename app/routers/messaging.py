@@ -317,24 +317,18 @@ async def send_message(
         else:
             outgoing_content, masked = filter_message_content(message.content)
 
-        # Create message in Firebase (write the MASKED content to both sides)
-        message_data = {
-            'content': outgoing_content,
-            'senderId': current_user_firebase_uid,
-            'timestamp': firestore.SERVER_TIMESTAMP,
-            'messageType': message.message_type or 'text',
-            'hasMaskedContent': masked,
-        }
+        # SCHEDULING V2 — SINGLE-WRITER CHAT SEND (Fix B):
+        # The iOS client is the sole writer of the Firestore message doc and the
+        # conversation `lastMessage`. This endpoint must NOT write to Firestore,
+        # otherwise two docs are produced per send and the client's (formerly
+        # unmasked) doc wins the render. Instead we authoritatively MASK here and
+        # RETURN the masked content + flag; the client writes exactly that masked
+        # content + `hasMaskedContent` into the single Firestore doc. This keeps
+        # masking authoritative while preserving offline-friendly client writes.
+        # (Previously this handler also `.add()`ed a masked Firestore doc + a
+        # lastMessage update — removed to collapse to one writer.)
 
-        message_ref = conversation_ref.collection('messages').add(message_data)
-
-        # Update conversation with last message
-        conversation_ref.update({
-            'lastMessage': outgoing_content,
-            'lastMessageTime': firestore.SERVER_TIMESTAMP
-        })
-
-        # Also create message in PostgreSQL for analytics (masked content + flag).
+        # Mirror message into PostgreSQL for analytics (masked content + flag).
         # Resolve the PG Conversation by the participant PAIR (sender + recipient),
         # not the Firestore string id — see create_message_in_postgresql.
         if other_user_for_match is not None:
@@ -354,7 +348,9 @@ async def send_message(
                 push_recipient_q = await db.execute(select(User).where(User.firebase_uid == other_uid_for_push))
                 push_recipient = push_recipient_q.scalar_one_or_none()
                 if push_recipient:
-                    preview = message.content or ""
+                    # Use the MASKED content in the push preview so a phone
+                    # number never leaks through the notification.
+                    preview = outgoing_content or ""
                     await push.notify_new_message(
                         recipient=push_recipient,
                         sender_name=current_user.name or "Someone",
@@ -399,9 +395,10 @@ async def send_message(
         except Exception as exc:
             logger.warning(f"Failed to update match_outcomes funnel on send_message: {exc}")
 
+        # The iOS client writes the single Firestore doc using these masked
+        # fields, so there is no server-side Firestore message id to return.
         return {
             "success": True,
-            "message_id": message_ref[1].id,
             "content": outgoing_content,
             "has_masked_content": masked,
             "timestamp": datetime.now(timezone.utc)

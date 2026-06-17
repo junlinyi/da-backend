@@ -410,6 +410,14 @@ class Conversation(ConversationBase):
     class Config:
         from_attributes = True
 
+# NOTE: `MessageCreate` is defined ABOVE (see the "Messaging schemas" section,
+# the lightweight `content` + `message_type` request body used by the
+# /messaging send endpoint). This legacy block previously redefined a SECOND
+# `MessageCreate(MessageBase)` that required `conversation_id`/`sender_id`,
+# silently SHADOWING the intended one and causing the messaging send endpoint
+# to reject the iOS client's body with HTTP 422 (Scheduling V2 phone-mask
+# regression). The duplicate `MessageCreate` has been removed. `MessageBase`
+# and `Message` are retained for ORM-shaped reads.
 class MessageBase(BaseModel):
     conversation_id: int
     sender_id: int
@@ -417,9 +425,6 @@ class MessageBase(BaseModel):
     message_type: str = "text"
     is_read: bool = False
     firebase_id: Optional[str] = None
-
-class MessageCreate(MessageBase):
-    pass
 
 class Message(MessageBase):
     id: int

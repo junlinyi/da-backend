@@ -60,6 +60,36 @@ def test_assert_text_open_none_match_does_not_block():
 
 
 # ---------------------------------------------------------------------------
+# Regression — send_message request body schema (Scheduling V2 phone-mask
+# regression). `app.schemas` had defined `MessageCreate` TWICE; the second
+# (legacy, MessageBase-derived) definition shadowed the intended lightweight one
+# and required conversation_id/sender_id, so the iOS client's body
+# ({content, message_type}) was rejected with HTTP 422 BEFORE send_message ran —
+# meaning masking never happened. This guards the contract the iOS client uses:
+# the endpoint's MessageCreate must accept content (+ optional message_type)
+# alone, with NO conversation_id / sender_id required.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.nodb
+def test_message_create_accepts_ios_body_shape():
+    # Exactly what ChatViewModel.MessageCreateData encodes.
+    from app.routers.messaging import MessageCreate as RouterMessageCreate
+
+    m = RouterMessageCreate(content="hello", message_type="text")
+    assert m.content == "hello"
+    assert m.message_type == "text"
+
+    # message_type is optional (defaults to text).
+    m2 = RouterMessageCreate(content="hi")
+    assert m2.content == "hi"
+
+    # And it must NOT require conversation_id / sender_id.
+    fields = set(RouterMessageCreate.model_fields.keys())
+    assert "conversation_id" not in fields
+    assert "sender_id" not in fields
+
+
+# ---------------------------------------------------------------------------
 # Task 5.2 — mask is mirrored to the Postgres Message row
 # ---------------------------------------------------------------------------
 
