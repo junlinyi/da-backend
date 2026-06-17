@@ -87,8 +87,17 @@ async def test_db() -> TestDatabase:
 
 
 @pytest.fixture(autouse=True)
-async def setup_database(test_db: TestDatabase):
-    """Setup database for each test"""
+async def setup_database(request):
+    """Setup the SQLite database for each test.
+
+    Skips entirely for tests that use the Postgres harness (`conftest_pg.py`),
+    detected via the `db` fixture, so the broken SQLite ARRAY setup never runs
+    for those tests.
+    """
+    if "db" in request.fixturenames or request.node.get_closest_marker("nodb"):
+        yield
+        return
+    test_db = request.getfixturevalue("test_db")
     # Override the dependency
     app.dependency_overrides[get_db] = override_get_db
     yield
@@ -201,8 +210,16 @@ def large_time_slots():
 # Cleanup fixtures
 
 @pytest.fixture(autouse=True)
-async def cleanup_after_test(test_db: TestDatabase):
-    """Clean up after each test"""
+async def cleanup_after_test(request):
+    """Clean up after each test.
+
+    Skipped for Postgres-harness tests (those that use the `db` fixture), which
+    manage their own teardown.
+    """
+    if "db" in request.fixturenames or request.node.get_closest_marker("nodb"):
+        yield
+        return
+    test_db = request.getfixturevalue("test_db")
     yield
     # Clean up any test data
     async with test_db.async_session() as session:
@@ -220,6 +237,7 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "regression: Regression tests")
     config.addinivalue_line("markers", "performance: Performance tests")
     config.addinivalue_line("markers", "slow: Slow running tests")
+    config.addinivalue_line("markers", "nodb: Pure unit tests needing no database harness")
 
 
 # Test collection customization

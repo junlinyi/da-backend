@@ -15,6 +15,7 @@ from app.models import (
     User, Match, ScheduledCall, BehavioralEvent
 )
 from app.services import push_notification_service as push
+from app.services import match_state_service as mss
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -42,7 +43,8 @@ class SchedulingMonitorService:
     
     def __init__(self):
         self.is_running = False
-        self.check_interval = 300  # Check every 5 minutes
+        self.check_interval = 300  # Slow loop: expire + no-show, every 5 minutes
+        self.fast_interval = 60    # Fast loop: text-lock + nudges, every 1 minute
         self.notification_cooldown = 3600  # Don't send notifications more than once per hour
         
     async def start_monitoring(self):
@@ -71,190 +73,44 @@ class SchedulingMonitorService:
         """Stop the continuous monitoring service"""
         self.is_running = False
         logger.info("Stopping scheduling monitor service")
-    
-    async def expire_stale_matches(self, db: AsyncSession) -> int:
-        """Mark active matches as expired if past the 48-hour scheduling window with no call.
-
-        Returns the number of matches expired.
-        """
-        from app.models import MatchOutcome
-        now = utc_now()
-        cutoff = now - timedelta(hours=48)
-
-        # Find active matches older than 48 hours
-        stale_q = await db.execute(
-            select(Match).where(
-                Match.status.in_(["active", "accepted", "pending"]),
-                Match.created_at < cutoff,
-            )
-        )
-        stale_matches = stale_q.scalars().all()
-
-        expired_count = 0
-        for match in stale_matches:
-            # Skip if a completed/scheduled call exists for this match
-            call_q = await db.execute(
-                select(ScheduledCall).where(
-                    ScheduledCall.match_id == match.id,
-                    ScheduledCall.status.in_(["scheduled", "in_progress", "completed"]),
-                ).limit(1)
-            )
-            if call_q.scalars().first():
-                continue
-
-            match.status = "expired"
-            expired_count += 1
-
-        if expired_count:
-            await db.commit()
-            logger.info(f"[EXPIRY] Expired {expired_count} stale matches past 48-hour window")
-
-        return expired_count
-
-    async def notify_expiring_matches(self, db: AsyncSession) -> int:
-        """S7 — Notify both users when a match's 48h window has ≤6 hours left.
-
-        Uses the last_notification_sent cooldown to avoid re-sending within an hour.
-        Returns the number of notifications sent.
-        """
-        now = utc_now()
-        warning_cutoff = now - timedelta(hours=42)   # 42h elapsed → 6h remaining
-        expiry_cutoff = now - timedelta(hours=48)    # already expired
-
-        # Matches in the warning window: created between 42h and 48h ago
-        expiring_q = await db.execute(
-            select(Match).where(
-                Match.status.in_(["active", "accepted", "pending"]),
-                Match.created_at < warning_cutoff,
-                Match.created_at >= expiry_cutoff,
-            )
-        )
-        expiring_matches = expiring_q.scalars().all()
-
-        sent = 0
-        for match in expiring_matches:
-            # Skip if a call is already scheduled
-            call_q = await db.execute(
-                select(ScheduledCall).where(
-                    ScheduledCall.match_id == match.id,
-                    ScheduledCall.status.in_(["scheduled", "in_progress", "completed"]),
-                ).limit(1)
-            )
-            if call_q.scalars().first():
-                continue
-
-            # Load both users
-            u1_q = await db.execute(select(User).where(User.id == match.user_id))
-            u1 = u1_q.scalar_one_or_none()
-            u2_q = await db.execute(select(User).where(User.id == match.matched_user_id))
-            u2 = u2_q.scalar_one_or_none()
-            if not u1 or not u2:
-                continue
-
-            hours_left = max(0, int((match.created_at + timedelta(hours=48) - now).total_seconds() // 3600))
-
-            for user in (u1, u2):
-                try:
-                    other = u2 if user.id == u1.id else u1
-                    await push.notify_match_expiring(
-                        user=user,
-                        match_name=other.name or "your match",
-                        hours_left=hours_left,
-                    )
-                    sent += 1
-                except Exception as exc:
-                    logger.warning(f"[PUSH] S7 notification failed for user {user.id}: {exc}")
-
-        if sent:
-            logger.info(f"[EXPIRY_WARN] Sent {sent} match-expiry warning notifications")
-        return sent
-
-    async def detect_no_shows(self, db: AsyncSession) -> int:
-        """Mark scheduled calls as no_show when start_time + 20 min has passed and nobody joined.
-
-        Increments no_show_count on absent users and notifies the waiting partner.
-        Returns the number of calls marked as no_show.
-        """
-        now = utc_now()
-        no_show_cutoff = now - timedelta(minutes=20)
-
-        # Calls that started more than 20 minutes ago and are still in 'scheduled' state
-        stale_q = await db.execute(
-            select(ScheduledCall).where(
-                ScheduledCall.status == "scheduled",
-                ScheduledCall.scheduled_start_utc < no_show_cutoff,
-            )
-        )
-        stale_calls = stale_q.scalars().all()
-
-        count = 0
-        for call in stale_calls:
-            call.status = "no_show"
-            call.cancellation_reason = "no_show"
-            call.call_ended_at = now
-
-            # Load both participants
-            u1_q = await db.execute(select(User).where(User.id == call.user1_id))
-            u1 = u1_q.scalar_one_or_none()
-            u2_q = await db.execute(select(User).where(User.id == call.user2_id))
-            u2 = u2_q.scalar_one_or_none()
-
-            joined_ids: set[int] = set()
-            if call.call_started_at:
-                # If the call started at all, at least one user joined — treat both as present.
-                # Granular per-participant tracking requires Twilio webhook data; skip for now.
-                joined_ids = {call.user1_id, call.user2_id}
-
-            for user in (u for u in [u1, u2] if u is not None):
-                if user.id not in joined_ids:
-                    # Increment no_show counter on absent user
-                    user.no_show_count = (user.no_show_count or 0) + 1
-                    user.last_no_show_at = now
-
-                    # Log a behavioral event for the ML system
-                    db.add(BehavioralEvent(
-                        user_id=user.id,
-                        event_type="call_no_show",
-                        event_meta={"call_id": call.id, "match_id": call.match_id},
-                    ))
-
-            # Notify the waiting user (the one who joined when the other didn't)
-            if u1 and u2 and not joined_ids:
-                # Neither joined — notify both that the call didn't happen
-                for waiting, absent in [(u1, u2), (u2, u1)]:
-                    try:
-                        await push.notify_no_show_partner(
-                            waiting_user=waiting,
-                            absent_name=absent.name or "Your match",
-                            call_id=call.id,
-                        )
-                    except Exception as exc:
-                        logger.warning(f"[NO_SHOW] Push failed for user {waiting.id}: {exc}")
-
-            count += 1
-
-        if count:
-            await db.commit()
-            logger.info(f"[NO_SHOW] Marked {count} call(s) as no_show")
-
-        return count
 
     async def check_all_matches(self):
-        """Run periodic scheduling housekeeping (expiry, no-show detection, expiry warnings)."""
+        """Slow loop (every check_interval): V2 expiry + no-show detection.
+
+        Each cron body manages its own per-row error isolation; we commit once
+        per tick after both run on a fresh session.
+        """
         async for db in get_db_session():
             try:
-                # Expire matches that have passed the 48h scheduling window
-                await self.expire_stale_matches(db)
-
-                # Mark calls that were never joined as no_show
-                await self.detect_no_shows(db)
-
-                # S7 — warn users whose match window is almost closed
-                await self.notify_expiring_matches(db)
-
+                await mss.expire_unscheduled_matches(db)
+                await mss.notify_expiring_soon_matches(db)
+                await mss.detect_no_shows(db)
+                await mss.send_date_reminders(db)
+                await db.commit()
             except Exception as e:
-                logger.error(f"Error checking matches: {e}")
+                logger.error(f"[MONITOR] Error in check_all_matches tick: {e}", exc_info=True)
                 await db.rollback()
+            break
+
+    async def fast_loop(self):
+        """Fast loop (every fast_interval=60s): V2 text-lock + pre-lock nudges."""
+        logger.info("Starting scheduling monitor FAST loop (text-lock + nudges)")
+        while self.is_running:
+            async for db in get_db_session():
+                try:
+                    await mss.lock_text_for_eligible_matches(db)
+                    await mss.notify_text_window_nudges(db)
+                    await db.commit()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.error(f"[MONITOR] Error in fast_loop tick: {e}", exc_info=True)
+                    await db.rollback()
+                break
+            try:
+                await asyncio.sleep(self.fast_interval)
+            except asyncio.CancelledError:
+                logger.info("Scheduling monitor fast_loop received CancelledError — shutting down")
                 break
 
 # Global instance
@@ -267,4 +123,12 @@ async def start_scheduling_monitor():
 
 async def stop_scheduling_monitor():
     """Stop the scheduling monitor"""
-    await scheduling_monitor.stop_monitoring() 
+    await scheduling_monitor.stop_monitoring()
+
+
+async def start_fast_monitor():
+    """Start the 60s text-lock + nudge loop as a background task."""
+    # The fast loop and slow loop share `is_running`; ensure it's set so the
+    # fast loop runs even if started before/independently of the slow loop.
+    scheduling_monitor.is_running = True
+    await scheduling_monitor.fast_loop()

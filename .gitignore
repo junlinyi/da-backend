@@ -15,3 +15,7 @@ build/
 
 # OS
 .DS_Store
+
+# Test artifacts
+test.db
+.pytest_cache/

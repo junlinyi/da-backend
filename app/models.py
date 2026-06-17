@@ -1,7 +1,7 @@
 # app/models.py
 
 from datetime import datetime, time, date
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Boolean, Text, Float, func, ARRAY, UniqueConstraint, Time, Date, CheckConstraint, JSON, Index
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Boolean, Text, Float, func, ARRAY, UniqueConstraint, Time, Date, CheckConstraint, JSON, Index, text
 from sqlalchemy.orm import relationship
 from app.database import Base
 
@@ -55,6 +55,9 @@ class User(Base):
     # Accountability tracking
     no_show_count = Column(Integer, default=0, nullable=False)
     last_no_show_at = Column(DateTime(timezone=True), nullable=True)
+    total_calls_scheduled = Column(Integer, default=0, nullable=False)
+    total_calls_completed = Column(Integer, default=0, nullable=False)
+    phone_country_code = Column(String(8), nullable=True)
 
     # Push Notifications
     device_token = Column(String, nullable=True)  # APNs/FCM device token
@@ -73,6 +76,10 @@ class User(Base):
     # ML matchmaking relationships
     values_profile = relationship("UserValues", back_populates="user", uselist=False, cascade="all, delete-orphan")
     feature_vector = relationship("UserFeatureVector", back_populates="user", uselist=False, cascade="all, delete-orphan")
+
+    __table_args__ = (
+        Index("idx_users_no_show_count", "no_show_count", postgresql_where=text("no_show_count > 0")),
+    )
 
 
 class Match(Base):
@@ -94,13 +101,38 @@ class Match(Base):
     user2_unread_count = Column(Integer, default=0)
     user1_status = Column(String, default="active")  # active, inactive, blocked
     user2_status = Column(String, default="active")
-    
+
+    # --- Scheduling V2: three orthogonal state dimensions ---
+    text_state = Column(String(20), nullable=False, default="open")       # open|locked|archived
+    call_status = Column(String(30), nullable=False, default="none")      # none|proposal_pending|scheduled|in_progress|pending_survey|completed|no_show
+    lifecycle = Column(String(20), nullable=False, default="active")      # active|terminated|expired
+    text_locked_at = Column(DateTime(timezone=True), nullable=True)
+    text_unlocked_at = Column(DateTime(timezone=True), nullable=True)
+    expires_at = Column(DateTime(timezone=True), nullable=True)           # = text_locked_at + 72h once locked
+    exit_survey_user_a_response = Column(Boolean, nullable=True)
+    exit_survey_user_a_responded_at = Column(DateTime(timezone=True), nullable=True)
+    exit_survey_user_b_response = Column(Boolean, nullable=True)
+    exit_survey_user_b_responded_at = Column(DateTime(timezone=True), nullable=True)
+    contact_reveal_unlocked = Column(Boolean, nullable=False, default=False)
+    contact_revealed_to_user_a_at = Column(DateTime(timezone=True), nullable=True)
+    contact_revealed_to_user_b_at = Column(DateTime(timezone=True), nullable=True)
+    video_call_proposals = relationship("VideoCallProposal", back_populates="match", cascade="all, delete-orphan")
+    no_show_events = relationship("NoShowEvent", back_populates="match", cascade="all, delete-orphan")
+
     # Relationships
     scheduled_calls = relationship("ScheduledCall", back_populates="match", cascade="all, delete-orphan")
     
     # Unique constraint to prevent duplicate matches
     __table_args__ = (
         UniqueConstraint('user_id', 'matched_user_id', name='uq_user_matched_user'),
+        CheckConstraint("text_state IN ('open','locked','archived')", name="chk_text_state"),
+        CheckConstraint("call_status IN ('none','proposal_pending','scheduled','in_progress','pending_survey','completed','no_show')", name="chk_call_status"),
+        CheckConstraint("lifecycle IN ('active','terminated','expired')", name="chk_lifecycle"),
+        Index("idx_matches_text_state", "text_state"),
+        Index("idx_matches_call_status", "call_status"),
+        Index("idx_matches_lifecycle", "lifecycle"),
+        Index("idx_matches_text_locked_at", "text_locked_at", postgresql_where=text("text_locked_at IS NOT NULL")),
+        Index("idx_matches_active_needs_action", "lifecycle", "text_state", "call_status", postgresql_where=text("lifecycle = 'active'")),
     )
 
 
@@ -135,12 +167,14 @@ class Message(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     conversation_id = Column(Integer, ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False)
-    sender_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    sender_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True)  # NULL = system message
     content = Column(Text, nullable=False)
     message_type = Column(String, default="text")  # text, image, video, audio
     timestamp = Column(DateTime(timezone=True), server_default=func.now())
     is_read = Column(Boolean, default=False)
     firebase_id = Column(String, unique=True, nullable=True)  # Firebase message ID for syncing
+    has_masked_content = Column(Boolean, nullable=False, default=False)
+    system_message_type = Column(String(40), nullable=True)
 
 
 # Video Call Scheduling Models
@@ -166,6 +200,10 @@ class ScheduledCall(Base):
     user2_confirmed = Column(Boolean, default=False)
     user1_confirmed_at = Column(DateTime(timezone=True), nullable=True)
     user2_confirmed_at = Column(DateTime(timezone=True), nullable=True)
+
+    # Join signals (set when a user actually joins the call) — drive no-show detection
+    user1_joined = Column(Boolean, default=False, nullable=False)
+    user2_joined = Column(Boolean, default=False, nullable=False)
     
     # Call metadata
     call_room_id = Column(String(255), nullable=True)  # Twilio room ID or similar
@@ -251,86 +289,47 @@ class UserSchedulingPreferences(Base):
 
 
 # ============================================================================
-# Scheduling Proposal System Models
+# Scheduling V2 Models
 # ============================================================================
 
-class SchedulingProposal(Base):
-    """Scheduling proposals from one user to another with multiple time slot options"""
-    __tablename__ = "scheduling_proposals"
-    
-    id = Column(Integer, primary_key=True, index=True)
+class VideoCallProposal(Base):
+    __tablename__ = "video_call_proposals"
+    id = Column(Integer, primary_key=True)
     match_id = Column(Integer, ForeignKey("matches.id", ondelete="CASCADE"), nullable=False)
-    proposer_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    receiver_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    
-    # Proposal status: pending, accepted, rejected, counter_proposed, expired
-    status = Column(String(20), nullable=False, default="pending")
-    message = Column(Text, nullable=True)  # Optional message from proposer
-    
-    # Timestamps
+    proposer_user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    proposed_start_utc = Column(DateTime(timezone=True), nullable=False)
+    proposed_end_utc = Column(DateTime(timezone=True), nullable=False)
+    status = Column(String(20), nullable=False, default="pending")  # pending|accepted|superseded
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-    expires_at = Column(DateTime(timezone=True), nullable=False)  # Auto-expire after 24 hours
     responded_at = Column(DateTime(timezone=True), nullable=True)
-    
-    # Relationships
-    match = relationship("Match", backref="scheduling_proposals")
-    proposer = relationship("User", foreign_keys=[proposer_id])
-    receiver = relationship("User", foreign_keys=[receiver_id])
-    time_slots = relationship("ProposalTimeSlot", back_populates="proposal", cascade="all, delete-orphan")
-    responses = relationship("ProposalResponse", back_populates="proposal", cascade="all, delete-orphan")
+    match = relationship("Match", back_populates="video_call_proposals")
+    proposer = relationship("User")
+    __table_args__ = (
+        CheckConstraint("status IN ('pending','accepted','superseded')", name="chk_vcp_status"),
+        Index("idx_one_pending_proposal_per_match", "match_id",
+              unique=True, postgresql_where=text("status = 'pending'")),
+        Index("idx_video_call_proposals_match", "match_id"),
+        Index("idx_video_call_proposals_proposer", "proposer_user_id"),
+        Index("idx_video_call_proposals_status", "status"),
+    )
 
 
-class ProposalTimeSlot(Base):
-    """Time slots proposed within a scheduling proposal (2-3 options)"""
-    __tablename__ = "proposal_time_slots"
-    
-    id = Column(Integer, primary_key=True, index=True)
-    proposal_id = Column(Integer, ForeignKey("scheduling_proposals.id", ondelete="CASCADE"), nullable=False)
-    
-    start_time = Column(DateTime(timezone=True), nullable=False)
-    end_time = Column(DateTime(timezone=True), nullable=False)
-    is_selected = Column(Boolean, nullable=False, default=False)  # Set to True when accepted
-    
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    
-    # Relationships
-    proposal = relationship("SchedulingProposal", back_populates="time_slots")
-
-
-class ProposalResponse(Base):
-    """Response to a scheduling proposal (accept/reject/counter)"""
-    __tablename__ = "proposal_responses"
-    
-    id = Column(Integer, primary_key=True, index=True)
-    proposal_id = Column(Integer, ForeignKey("scheduling_proposals.id", ondelete="CASCADE"), nullable=False)
-    
-    # Response type: accept, reject, counter_propose
-    response_type = Column(String(20), nullable=False)
-    selected_slot_id = Column(Integer, ForeignKey("proposal_time_slots.id"), nullable=True)  # For accepts
-    counter_proposal_message = Column(Text, nullable=True)  # For counter proposals
-    
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    
-    # Relationships
-    proposal = relationship("SchedulingProposal", back_populates="responses")
-    selected_slot = relationship("ProposalTimeSlot")
-    counter_time_slots = relationship("CounterProposalTimeSlot", back_populates="response", cascade="all, delete-orphan")
-
-
-class CounterProposalTimeSlot(Base):
-    """Time slots for counter proposals"""
-    __tablename__ = "counter_proposal_time_slots"
-    
-    id = Column(Integer, primary_key=True, index=True)
-    response_id = Column(Integer, ForeignKey("proposal_responses.id", ondelete="CASCADE"), nullable=False)
-    
-    start_time = Column(DateTime(timezone=True), nullable=False)
-    end_time = Column(DateTime(timezone=True), nullable=False)
-    
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    
-    # Relationships
-    response = relationship("ProposalResponse", back_populates="counter_time_slots")
+class NoShowEvent(Base):
+    __tablename__ = "no_show_events"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    match_id = Column(Integer, ForeignKey("matches.id", ondelete="CASCADE"), nullable=False)
+    scheduled_call_id = Column(Integer, ForeignKey("scheduled_calls.id", ondelete="CASCADE"), nullable=False)
+    detected_at = Column(DateTime(timezone=True), server_default=func.now())
+    event_type = Column(String(20), nullable=False, default="no_show")  # no_show|partial
+    match = relationship("Match", back_populates="no_show_events")
+    __table_args__ = (
+        CheckConstraint("event_type IN ('no_show','partial')", name="chk_nse_type"),
+        Index("idx_no_show_events_user_match", "user_id", "match_id"),
+        Index("idx_no_show_events_user", "user_id", text("detected_at DESC")),
+        Index("idx_no_show_events_match", "match_id"),
+        Index("idx_no_show_events_call", "scheduled_call_id"),
+    )
 
 
 # ============================================================================
@@ -379,28 +378,6 @@ class Report(Base):
             name='reports_context_valid'
         ),
         Index('ix_reports_status_category', 'status', 'category'),
-    )
-
-
-class CallRequest(Base):
-    """Tier 1 post-match spontaneous call requests (5-minute live call window)"""
-    __tablename__ = "call_requests"
-
-    id = Column(Integer, primary_key=True, index=True)
-    match_id = Column(Integer, ForeignKey("matches.id"), nullable=False)
-    requester_id = Column(Integer, ForeignKey("users.id"), nullable=False)   # User B (triggered the match)
-    recipient_id = Column(Integer, ForeignKey("users.id"), nullable=False)   # User A (was swiped on)
-    status = Column(String(20), nullable=False, default="pending")           # pending, accepted, declined, expired
-    room_name = Column(String(255), nullable=True)                           # set on accept: "tier1-{id}"
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    expires_at = Column(DateTime(timezone=True), nullable=False)             # created_at + 5 minutes
-
-    requester = relationship("User", foreign_keys=[requester_id])
-    recipient = relationship("User", foreign_keys=[recipient_id])
-    match = relationship("Match")
-
-    __table_args__ = (
-        CheckConstraint("status IN ('pending','accepted','declined','expired')", name="valid_call_request_status"),
     )
 
 

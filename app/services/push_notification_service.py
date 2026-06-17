@@ -82,151 +82,18 @@ def _no_token(user_name: str, notification_type: str) -> None:
 # Typed notification functions
 # ---------------------------------------------------------------------------
 
-async def notify_immediate_call_request(recipient, caller, call_id: int) -> None:
-    """S1 — User B gets notified when User A taps 'Call Now'."""
-    if not _push_enabled(recipient):
-        _no_token(recipient.name or "?", "immediate_call_request")
-        return
-    await send_push(
-        token=recipient.device_token,
-        title=f"{caller.name or 'Someone'} wants to call now!",
-        body="They're available right now for a 15-min video call. Tap to join.",
-        data={
-            "type": "immediate_call_request",
-            "caller_name": caller.name or "",
-            "call_id": call_id,
-        },
-    )
+# ---------------------------------------------------------------------------
+# Scheduling V2 — typed senders (Task 7.1)
+#
+# Copy is taken from DatingAppProj/NOTIFICATIONS.md (canonical taxonomy) /
+# SCHEDULING_V2.md §Push Notifications. All user-facing copy says "video date".
+# `data.type` matches the V2 notification id so the iOS NotificationRouter can
+# route. Every sender no-ops when _push_enabled() is False.
+# ---------------------------------------------------------------------------
 
 
-async def notify_proposal_received(recipient, proposer, proposal_id: int) -> None:
-    """S2 — User B gets notified when User A submits a Tier 2 proposal."""
-    if not _push_enabled(recipient):
-        _no_token(recipient.name or "?", "proposal_received")
-        return
-    await send_push(
-        token=recipient.device_token,
-        title=f"{proposer.name or 'Someone'} proposed call times",
-        body="They suggested a few time windows. Pick the one that works for you.",
-        data={
-            "type": "proposal_received",
-            "proposer_name": proposer.name or "",
-            "proposal_id": proposal_id,
-        },
-    )
-
-
-async def notify_proposal_accepted(proposer, accepter, call_id: int) -> None:
-    """S3 — User A gets notified when User B accepts their proposal."""
-    if not _push_enabled(proposer):
-        _no_token(proposer.name or "?", "proposal_accepted")
-        return
-    await send_push(
-        token=proposer.device_token,
-        title=f"{accepter.name or 'Someone'} accepted your proposal!",
-        body="Your call is now scheduled. Check your upcoming calls.",
-        data={
-            "type": "proposal_accepted",
-            "accepter_name": accepter.name or "",
-            "call_id": call_id,
-        },
-    )
-
-
-async def notify_proposal_rejected(proposer, rejecter) -> None:
-    """S4 — User A gets notified when User B rejects their proposal."""
-    if not _push_enabled(proposer):
-        _no_token(proposer.name or "?", "proposal_rejected")
-        return
-    await send_push(
-        token=proposer.device_token,
-        title=f"{rejecter.name or 'Someone'} passed on your times",
-        body="They couldn't make those times work. You can propose new ones.",
-        data={
-            "type": "proposal_rejected",
-            "rejecter_name": rejecter.name or "",
-        },
-    )
-
-
-async def notify_counter_proposal_received(recipient, proposer, proposal_id: int) -> None:
-    """S9 — Original proposer gets notified of a counter-proposal."""
-    if not _push_enabled(recipient):
-        _no_token(recipient.name or "?", "counter_proposal_received")
-        return
-    await send_push(
-        token=recipient.device_token,
-        title=f"{proposer.name or 'Someone'} suggested different times",
-        body="They proposed new time windows. Pick one to confirm your call.",
-        data={
-            "type": "proposal_received",
-            "proposer_name": proposer.name or "",
-            "proposal_id": proposal_id,
-        },
-    )
-
-
-async def notify_call_reminder(user, call, minutes_before: int) -> None:
-    """S5/S6 — Remind both users before a scheduled call."""
-    if not _push_enabled(user):
-        _no_token(user.name or "?", f"call_reminder_{minutes_before}min")
-        return
-
-    if minutes_before >= 60:
-        title = "Call starting in 1 hour"
-        body = "Your 15-min video call is coming up. Get ready!"
-    else:
-        title = f"Call starting in {minutes_before} minutes"
-        body = "Your video call is almost here. Tap to join when ready."
-
-    await send_push(
-        token=user.device_token,
-        title=title,
-        body=body,
-        data={
-            "type": "call_reminder",
-            "call_id": call.id,
-            "minutes_before": minutes_before,
-        },
-    )
-
-
-async def notify_match_expiring(user, match_name: str, hours_left: int) -> None:
-    """S7 — Both users notified when the 48h scheduling window is almost closed."""
-    if not _push_enabled(user):
-        _no_token(user.name or "?", "match_expiring")
-        return
-    await send_push(
-        token=user.device_token,
-        title=f"Schedule your call with {match_name}!",
-        body=f"Only {hours_left} hours left to schedule your 15-min call before the match expires.",
-        data={
-            "type": "match_expiring",
-            "match_name": match_name,
-            "hours_left": hours_left,
-        },
-    )
-
-
-async def notify_availability_match(user1, user2, slot_count: int) -> None:
-    """S8 — Both users notified when common availability is found."""
-    for user, other in [(user1, user2), (user2, user1)]:
-        if not _push_enabled(user):
-            _no_token(user.name or "?", "availability_match")
-            continue
-        await send_push(
-            token=user.device_token,
-            title=f"You and {other.name or 'your match'} are both free!",
-            body=(
-                f"You have {slot_count} time slot{'s' if slot_count != 1 else ''} in common "
-                "this week. Schedule your call now!"
-            ),
-            data={
-                "type": "availability_match",
-                "match_name": other.name or "",
-                "slot_count": slot_count,
-            },
-        )
+def _name(user) -> str:
+    return (getattr(user, "name", None) or "Someone")
 
 
 async def notify_new_match(recipient, matcher_name: str, match_id: int) -> None:
@@ -242,23 +109,6 @@ async def notify_new_match(recipient, matcher_name: str, match_id: int) -> None:
             "type": "new_match",
             "matcher_name": matcher_name,
             "match_id": match_id,
-        },
-    )
-
-
-async def notify_no_show_partner(waiting_user, absent_name: str, call_id: int) -> None:
-    """Notify a user that their match did not join the scheduled call."""
-    if not _push_enabled(waiting_user):
-        _no_token(waiting_user.name or "?", "no_show_partner")
-        return
-    await send_push(
-        token=waiting_user.device_token,
-        title="Your match didn't show up",
-        body=f"{absent_name} didn't join your video call. We've noted this on their account.",
-        data={
-            "type": "no_show_partner",
-            "absent_name": absent_name,
-            "call_id": call_id,
         },
     )
 
@@ -282,4 +132,255 @@ async def notify_new_message(recipient, sender_name: str, conversation_id: int, 
             "sender_name": sender_name,
             "conversation_id": conversation_id,
         },
+    )
+
+
+# ===========================================================================
+# Scheduling V2 — the 16 typed senders (Task 7.1)
+#
+# Each takes the recipient User + context (peer_name, match_id, …).
+# Copy from DatingAppProj/NOTIFICATIONS.md / SCHEDULING_V2.md §Push
+# Notifications. "video date" everywhere. data.type == the V2 notification id.
+# ===========================================================================
+
+
+# --- Texting-window nudges + lock (cron-triggered) -------------------------
+
+async def notify_text_window_5h_remaining(recipient, peer_name: str, match_id: int) -> None:
+    """5h before the 24h text lock, no date scheduled. (Nudge 1 of 2.)"""
+    if not _push_enabled(recipient):
+        _no_token(_name(recipient), "text_window_5h_remaining")
+        return
+    await send_push(
+        token=recipient.device_token,
+        title="Schedule your video date",
+        body=f"5 hours of free chat left with {peer_name}. Schedule your video date.",
+        data={"type": "text_window_5h_remaining", "match_id": match_id, "peer_name": peer_name},
+    )
+
+
+async def notify_text_window_locking(recipient, peer_name: str, match_id: int) -> None:
+    """1h before the 24h text lock, no date scheduled. (Nudge 2 of 2.)"""
+    if not _push_enabled(recipient):
+        _no_token(_name(recipient), "text_window_locking")
+        return
+    await send_push(
+        token=recipient.device_token,
+        title="Text pauses in 1 hour",
+        body=f"Text with {peer_name} pauses in 1 hour. Schedule your video date.",
+        data={"type": "text_window_locking", "match_id": match_id, "peer_name": peer_name},
+    )
+
+
+async def notify_text_locked(recipient, peer_name: str, match_id: int) -> None:
+    """At the 24h text lock with no date scheduled."""
+    if not _push_enabled(recipient):
+        _no_token(_name(recipient), "text_locked")
+        return
+    await send_push(
+        token=recipient.device_token,
+        title="Text paused",
+        body=f"Text with {peer_name} is paused. Schedule your video date to continue.",
+        data={"type": "text_locked", "match_id": match_id, "peer_name": peer_name},
+    )
+
+
+# --- Proposal lifecycle (endpoint-triggered) -------------------------------
+
+async def notify_proposal_received(recipient, peer_name: str, match_id: int, when: str = "") -> None:
+    """The non-proposer is notified a video date was proposed.
+
+    `when` is a pre-formatted human date+time string (e.g. "Thu 8 PM").
+    """
+    if not _push_enabled(recipient):
+        _no_token(_name(recipient), "proposal_received")
+        return
+    when_suffix = f" for {when}" if when else ""
+    await send_push(
+        token=recipient.device_token,
+        title="New video date proposed",
+        body=f"{peer_name} proposed a video date{when_suffix}. Open the app to review.",
+        data={"type": "proposal_received", "match_id": match_id, "peer_name": peer_name},
+    )
+
+
+async def notify_proposal_accepted(recipient, peer_name: str, match_id: int, when: str = "") -> None:
+    """The original proposer is notified their proposal was accepted."""
+    if not _push_enabled(recipient):
+        _no_token(_name(recipient), "proposal_accepted")
+        return
+    when_suffix = f" See you {when}." if when else ""
+    await send_push(
+        token=recipient.device_token,
+        title="Video date confirmed!",
+        body=f"{peer_name} accepted your video date!{when_suffix}",
+        data={"type": "proposal_accepted", "match_id": match_id, "peer_name": peer_name},
+    )
+
+
+async def notify_counter_proposal_received(recipient, peer_name: str, match_id: int, when: str = "") -> None:
+    """The original proposer is notified of a counter-proposed time."""
+    if not _push_enabled(recipient):
+        _no_token(_name(recipient), "counter_proposal_received")
+        return
+    when_suffix = f": {when}" if when else ""
+    await send_push(
+        token=recipient.device_token,
+        title="A different video date time",
+        body=f"{peer_name} proposed a different time{when_suffix}. Review and accept?",
+        data={"type": "counter_proposal_received", "match_id": match_id, "peer_name": peer_name},
+    )
+
+
+# --- Match expiry (cron-triggered) -----------------------------------------
+
+async def notify_match_expiring_soon(recipient, peer_name: str, match_id: int) -> None:
+    """24h before the match expires with no scheduled date."""
+    if not _push_enabled(recipient):
+        _no_token(_name(recipient), "match_expiring_soon")
+        return
+    await send_push(
+        token=recipient.device_token,
+        title="Your match is expiring",
+        body=f"Your match with {peer_name} expires in 24 hours. Schedule your video date.",
+        data={"type": "match_expiring_soon", "match_id": match_id, "peer_name": peer_name},
+    )
+
+
+async def notify_match_expired_unscheduled(recipient, peer_name: str, match_id: int) -> None:
+    """72h post-lock elapsed without scheduling — match expired."""
+    if not _push_enabled(recipient):
+        _no_token(_name(recipient), "match_expired_unscheduled")
+        return
+    await send_push(
+        token=recipient.device_token,
+        title="Your match expired",
+        body=(
+            f"Your match with {peer_name} expired. "
+            "Schedule a video date within 72 hours next time."
+        ),
+        data={"type": "match_expired_unscheduled", "match_id": match_id, "peer_name": peer_name},
+    )
+
+
+# --- Date timing reminders (cron-triggered) --------------------------------
+
+async def notify_date_starting_soon(recipient, peer_name: str, match_id: int, minutes: int = 15) -> None:
+    """15 min before the scheduled date start."""
+    if not _push_enabled(recipient):
+        _no_token(_name(recipient), "date_starting_soon")
+        return
+    await send_push(
+        token=recipient.device_token,
+        title="Your video date is soon",
+        body=f"Your video date with {peer_name} starts in {minutes} minutes.",
+        data={"type": "date_starting_soon", "match_id": match_id, "peer_name": peer_name},
+    )
+
+
+async def notify_date_starting_now(recipient, peer_name: str, match_id: int) -> None:
+    """At the scheduled date start time."""
+    if not _push_enabled(recipient):
+        _no_token(_name(recipient), "date_starting_now")
+        return
+    await send_push(
+        token=recipient.device_token,
+        title="Your video date is starting",
+        body=f"Your video date with {peer_name} is starting. Tap to join.",
+        data={"type": "date_starting_now", "match_id": match_id, "peer_name": peer_name},
+    )
+
+
+# --- No-show outcomes (endpoint + cron triggered) --------------------------
+
+async def notify_date_no_show_reschedule(recipient, peer_name: str, match_id: int) -> None:
+    """After no-show #1 on this match (match NOT terminated)."""
+    if not _push_enabled(recipient):
+        _no_token(_name(recipient), "date_no_show_reschedule")
+        return
+    await send_push(
+        token=recipient.device_token,
+        title="Missed video date",
+        body=f"{peer_name} missed your video date. Reschedule when ready.",
+        data={"type": "date_no_show_reschedule", "match_id": match_id, "peer_name": peer_name},
+    )
+
+
+async def notify_match_terminated_no_show(recipient, peer_name: str, match_id: int) -> None:
+    """After no-show #2 by the same user on this match — match terminated."""
+    if not _push_enabled(recipient):
+        _no_token(_name(recipient), "match_terminated_no_show")
+        return
+    await send_push(
+        token=recipient.device_token,
+        title="Match ended",
+        body=f"Your match with {peer_name} ended after missed video dates.",
+        data={"type": "match_terminated_no_show", "match_id": match_id, "peer_name": peer_name},
+    )
+
+
+# --- Exit-survey outcomes (endpoint-triggered) -----------------------------
+
+async def notify_exit_survey_prompt(recipient, peer_name: str, match_id: int) -> None:
+    """The video date ended — prompt both users for the exit survey."""
+    if not _push_enabled(recipient):
+        _no_token(_name(recipient), "exit_survey_prompt")
+        return
+    await send_push(
+        token=recipient.device_token,
+        title="How was your video date?",
+        body=f"How was your video date with {peer_name}? Tap to respond.",
+        data={"type": "exit_survey_prompt", "match_id": match_id, "peer_name": peer_name},
+    )
+
+
+async def notify_partner_responded_yes(recipient, peer_name: str, match_id: int) -> None:
+    """One user said yes on the exit survey; the non-responder is nudged."""
+    if not _push_enabled(recipient):
+        _no_token(_name(recipient), "partner_responded_yes")
+        return
+    await send_push(
+        token=recipient.device_token,
+        title="Keep talking?",
+        body=f"{peer_name} wants to keep talking. Tap to respond.",
+        data={"type": "partner_responded_yes", "match_id": match_id, "peer_name": peer_name},
+    )
+
+
+async def notify_text_unlocked_mutual_yes(recipient, peer_name: str, match_id: int) -> None:
+    """Both users said yes on the exit survey — chat reopens, contact unlocked."""
+    if not _push_enabled(recipient):
+        _no_token(_name(recipient), "text_unlocked_mutual_yes")
+        return
+    await send_push(
+        token=recipient.device_token,
+        title="It's mutual!",
+        body=(
+            f"{peer_name} also wants to keep talking. "
+            "Chat is open and you can now share contact info."
+        ),
+        data={"type": "text_unlocked_mutual_yes", "match_id": match_id, "peer_name": peer_name},
+    )
+
+
+async def notify_match_terminated_survey_no(recipient, peer_name: str, match_id: int, is_no_er: bool) -> None:
+    """Either user said no on the exit survey — asymmetric copy.
+
+    To the user who said no (`is_no_er=True`): a clean acknowledgement.
+    To the other user: a softer "not a mutual match" message (no blame).
+    """
+    if not _push_enabled(recipient):
+        _no_token(_name(recipient), "match_terminated_survey_no")
+        return
+    if is_no_er:
+        title = "Match ended"
+        body = "Got it — we've ended this match."
+    else:
+        title = "Not a match this time"
+        body = "It wasn't a mutual match this time."
+    await send_push(
+        token=recipient.device_token,
+        title=title,
+        body=body,
+        data={"type": "match_terminated_survey_no", "match_id": match_id, "peer_name": peer_name},
     )
