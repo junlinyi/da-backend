@@ -322,7 +322,8 @@ async def send_message(
             'content': outgoing_content,
             'senderId': current_user_firebase_uid,
             'timestamp': firestore.SERVER_TIMESTAMP,
-            'messageType': message.message_type or 'text'
+            'messageType': message.message_type or 'text',
+            'hasMaskedContent': masked,
         }
 
         message_ref = conversation_ref.collection('messages').add(message_data)
