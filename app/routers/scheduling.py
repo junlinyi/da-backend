@@ -308,6 +308,7 @@ async def get_my_matches(
                 name=peer.name if peer else None,
                 timezone=peer.timezone if peer else None,
                 no_show_count=(peer.no_show_count or 0) if peer else 0,
+                peer_firebase_uid=peer.firebase_uid if peer else None,
             ),
             text_state=match.text_state,
             call_status=match.call_status,

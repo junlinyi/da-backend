@@ -604,6 +604,9 @@ class ContactResponse(BaseModel):
 class PeerUserSummary(BaseModel):
     id: int; name: Optional[str] = None; timezone: Optional[str] = None
     no_show_count: int = 0
+    # SCHEDULING_V2 — lets the iOS client join a Firestore conversation
+    # (keyed by Firebase UID) to its backend MatchV2 by id.
+    peer_firebase_uid: Optional[str] = None
     class Config: from_attributes = True
 
 class MatchListItem(BaseModel):
