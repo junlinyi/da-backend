@@ -116,6 +116,21 @@ class AgeAttestation(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
 
 
+class PhotoScanLog(Base):
+    """Append-only audit trail: one row per profile-photo SafeSearch scan
+    (pass | block | error). See
+    docs/superpowers/specs/2026-06-18-nsfw-photo-scan-design.md."""
+    __tablename__ = "photo_scan_log"
+
+    id = Column(Integer, primary_key=True)
+    # Nullable: a brand-new signup is blocked before the user row gets an id.
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
+    image_url = Column(String, nullable=False)
+    decision = Column(String(16), nullable=False)  # 'pass' | 'block' | 'error'
+    scores = Column(JSON, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+
+
 class BirthdateChangeRequest(Base):
     """User-submitted request to correct an immutable birthdate; admin-reviewed.
     See AGE_VERIFICATION_SPEC.md F4/F5."""
