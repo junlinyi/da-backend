@@ -67,3 +67,17 @@
 **Summary:** Replaced bare `age:int` with stored `birthdate` (age derived on read), enforced 18+ on every write path + DB CHECK, added append-only age_attestations audit trail and admin-reviewed birthdate-correction flow. Migration applied to dev DB. 22 new tests green; full suite 0 regressions vs baseline. As-Built deviations (nullable birthdate, set-once via POST /users/create) documented in AGE_VERIFICATION_SPEC.md.
 **Status:** completed (follow-up: drop legacy `users.age` column after deploy; apply migration to staging/prod)
 ---
+
+## 2026-06-18 Task: Pass-4 UI audit backend gaps (unmatch, distance, likes city/tag)
+**Branch:** feature/pass4-backend-gaps
+**Files Modified:**
+- `app/routers/matches.py` — new `POST /matches/{match_id}/unmatch` (participant-auth, idempotent): terminates the match, closes the Postgres conversation, archives the Firestore conversation doc (mirrors block_user). Distinct from block, which stays.
+- `app/services/match_state_service.py` — new `unmatch()` (lifecycle→terminated, text_state→archived, deactivate conversation) and `get_terminated_match_user_ids()` discovery-exclusion helper.
+- `app/routers/matchmaking.py` — exclude terminated-match peers from the Postgres-fallback Discover; add rounded-miles `distance` to potential-matches; add `city` + representative `tag` (first interest) to `/matchmaking/likes/received`.
+- `app/services/firebase_matchmaking.py` — same terminated-match exclusion + `distance` in the primary (Firebase realtime) Discover path.
+- `app/schemas.py` — new `UnmatchResultResponse`.
+- `tests/test_unmatch.py` — 5 new DB-backed tests (terminate+close conversation, idempotent, unknown-match, bidirectional exclusion).
+
+**Summary:** Closed the four backend gaps behind the Pass-4 iOS TODOs. No migration needed (reuses existing `lifecycle='terminated'`). Distance surfaced in miles; likes tile gets city/tag. Verified against dev Postgres: new tests + `test_match_state_db.py` green (19 passed); app imports clean (no import cycle from the new cross-module helper).
+**Status:** completed (iOS wiring lands in a separate DatingAppProj PR). Pre-existing unrelated flake: `tests/test_matchmaking.py` module-level `initialize_app()` collides when collected with other firebase-initializing suites.
+---

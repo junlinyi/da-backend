@@ -593,3 +593,43 @@ async def process_exit_survey(db: AsyncSession, match_id: int, user_id: int, res
         m.contact_reveal_unlocked = True
     await db.flush()
     return m
+
+
+async def unmatch(db: AsyncSession, match_id: int) -> models.Match:
+    """User-initiated unmatch: terminate the match and close its conversation.
+
+    Mirrors the lifecycle termination used by the no-show / exit-survey-no paths
+    (`lifecycle='terminated'`, `text_state='archived'`) and deactivates the
+    Postgres conversation so neither user surfaces for the other (see also the
+    terminated-match discovery exclusion). Idempotent — a match that is already
+    terminated is returned unchanged. Caller must enforce participant auth first.
+    """
+    m = await _lock_match(db, match_id)
+    if m.lifecycle == "terminated":
+        return m
+    m.lifecycle = "terminated"
+    m.text_state = "archived"
+    conv = await _resolve_conversation_for_match(db, m)
+    if conv is not None:
+        conv.is_active = False
+    await db.flush()
+    return m
+
+
+async def get_terminated_match_user_ids(db: AsyncSession, user_id: int) -> set[int]:
+    """User ids the given user has a *terminated* match with (either direction).
+
+    Used by Discover to keep unmatched users from resurfacing (and re-matching)
+    regardless of which matchmaking path runs. Block uses a separate signal
+    (Match.status='blocked' + a deactivated conversation) and is unaffected.
+    """
+    rows = (await db.execute(
+        select(models.Match.user_id, models.Match.matched_user_id).where(
+            models.Match.lifecycle == "terminated",
+            or_(models.Match.user_id == user_id, models.Match.matched_user_id == user_id),
+        )
+    )).all()
+    peers: set[int] = set()
+    for a, b in rows:
+        peers.add(b if a == user_id else a)
+    return peers

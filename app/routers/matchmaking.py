@@ -12,13 +12,29 @@ from app.dependencies import verify_firebase_token, get_current_user
 from app.services.feature_service import upsert_feature_vector
 from app.services.match_creation import create_match_in_firestore
 from app.services import push_notification_service as push
-from typing import List
+from app.services import match_state_service as mss
+from typing import List, Optional
 from datetime import datetime, timedelta, timezone
+from geopy.distance import geodesic
 import logging
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _distance_miles(user_a: User, user_b: User) -> Optional[int]:
+    """Whole-miles distance between two users, or None if either lacks coords.
+
+    Distance is already computed in km for the max-distance filter; Discover
+    surfaces it in miles for the "· N mi away" city line on the swipe card.
+    """
+    if not (user_a.latitude and user_a.longitude and user_b.latitude and user_b.longitude):
+        return None
+    return round(geodesic(
+        (user_a.latitude, user_a.longitude),
+        (user_b.latitude, user_b.longitude),
+    ).miles)
 
 @router.get("/potential-matches")
 async def get_potential_matches(
@@ -108,6 +124,10 @@ async def _get_potential_matches_postgresql(user_id: str, db: AsyncSession):
         else:
             matched_user_ids.add(conv.user1_id)
 
+    # Exclude users this user has unmatched (terminated match) so they don't
+    # resurface in Discover or re-match.
+    matched_user_ids |= await mss.get_terminated_match_user_ids(db, current_user.id)
+
     # Get potential matches using ML-enhanced ranking
     matches_with_scores = await find_matches_ml(current_user.id, db)
 
@@ -129,6 +149,7 @@ async def _get_potential_matches_postgresql(user_id: str, db: AsyncSession):
                     "city": match.location if match.location else None,
                     "state": match.state
                 } if match.latitude and match.longitude else None,
+                "distance": _distance_miles(current_user, match),
                 "matchScore": score
             }
             potential_matches.append(match_data)
@@ -198,10 +219,14 @@ async def get_received_likes(
         if not liker:
             continue
 
+        # Representative tag for the tile caption: first interest if any.
+        tag = liker.interests[0] if liker.interests else None
         likes.append({
             "id": liker.firebase_uid,
             "name": liker.name or "Unknown",
             "profileImageUrl": liker.profile_image_url,
+            "city": liker.location,
+            "tag": tag,
             "likedAt": swipe.timestamp.isoformat() if swipe.timestamp else None
         })
 

@@ -649,6 +649,9 @@ class ExitSurveyRequest(BaseModel):
 class ExitSurveyResultResponse(BaseModel):
     match_lifecycle: str; call_status: str; text_state: str; contact_reveal_unlocked: bool
 
+class UnmatchResultResponse(BaseModel):
+    match_lifecycle: str; call_status: str; text_state: str
+
 class ContactResponse(BaseModel):
     peer_phone_number: Optional[str] = None
     peer_phone_country_code: Optional[str] = None

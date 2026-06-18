@@ -111,6 +111,52 @@ async def submit_exit_survey(
     )
 
 
+@router.post("/{match_id}/unmatch", response_model=schemas.UnmatchResultResponse)
+async def unmatch(
+    match_id: int,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """User-initiated unmatch: terminate the match and close the conversation.
+
+    Distinct from block (users.py block_user, which stays): this is the polite
+    "remove this match" action surfaced in the chat header and profile card.
+    The caller must be a participant; idempotent if already terminated. Sets
+    lifecycle='terminated' + text_state='archived', deactivates the Postgres
+    conversation, and archives the Firestore conversation doc so iOS stops
+    showing it. A terminated match is excluded from Discover for both users.
+    """
+    await _load_participant_match(db, match_id, user.id)
+    try:
+        m = await mss.unmatch(db, match_id)
+    except ValueError as e:
+        if str(e) == "match_not_found":
+            raise HTTPException(status_code=404, detail="Match not found")
+        raise
+    await db.commit()
+
+    # Archive the Firestore conversation so iOS stops showing it (mirrors
+    # block_user's SAFE-03 archive). Best-effort: the Postgres state is already
+    # committed and authoritative.
+    peer_id = m.matched_user_id if mss._is_user_a(m, user.id) else m.user_id
+    peer = (await db.execute(select(User).where(User.id == peer_id))).scalar_one_or_none()
+    if peer is not None and user.firebase_uid and peer.firebase_uid:
+        try:
+            from firebase_admin import firestore as fs_admin
+            fs_db = fs_admin.client()
+            sorted_uids = "_".join(sorted([user.firebase_uid, peer.firebase_uid]))
+            fs_db.collection("conversations").document(sorted_uids).set(
+                {"archived": True, "active": False}, merge=True)
+        except Exception:
+            logger.warning("Failed to archive Firestore conversation on unmatch", exc_info=True)
+
+    return schemas.UnmatchResultResponse(
+        match_lifecycle=m.lifecycle,
+        call_status=m.call_status,
+        text_state=m.text_state,
+    )
+
+
 @router.get("/{match_id}/contact", response_model=schemas.ContactResponse)
 async def get_contact(
     match_id: int,
