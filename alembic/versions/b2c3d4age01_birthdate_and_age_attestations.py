@@ -42,11 +42,18 @@ def upgrade() -> None:
     # 2. Backfill existing users from their stored age. Jan 1 is deliberate: it
     #    is the most conservative (oldest) DOB for a given age, so a backfill can
     #    never accidentally push an existing user under 18 (DD-8).
+    #
+    #    Only backfill SANE ages (18..120). Junk/sub-18 ages are left with a NULL
+    #    birthdate (which the CHECK below permits) — backfilling them would either
+    #    overflow make_date (e.g. age 9999 -> year -7973) or produce a birthdate
+    #    that violates the 18+ CHECK, aborting the whole migration. Those accounts
+    #    simply re-enter their DOB; pre-launch this is harmless, and it makes the
+    #    migration robust against bad existing rows.
     op.execute(
         """
         UPDATE users
         SET birthdate = make_date(EXTRACT(YEAR FROM CURRENT_DATE)::int - age, 1, 1)
-        WHERE age IS NOT NULL AND birthdate IS NULL
+        WHERE age IS NOT NULL AND age BETWEEN 18 AND 120 AND birthdate IS NULL
         """
     )
 
