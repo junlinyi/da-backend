@@ -6,9 +6,13 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from app.database import get_db
-from app.models import User, Report, ScheduledCall, Match
-from app.schemas import ReportResponse, ReportStatusUpdate, BanRequest
+from app.models import User, Report, ScheduledCall, Match, BirthdateChangeRequest
+from app.schemas import (
+    ReportResponse, ReportStatusUpdate, BanRequest,
+    BirthdateChangeRequestAdminItem, BirthdateChangeRequestAdminAction,
+)
 from app.dependencies import require_admin
+from app.services.age_service import approve_birthdate_change, compute_age, BirthdateValidationError
 import logging
 
 logger = logging.getLogger(__name__)
@@ -299,3 +303,72 @@ async def get_user_admin_view(
             for r in reports
         ]
     }
+
+
+# ---------------------------------------------------------------------------
+# Birthdate change requests (AGE_VERIFICATION_SPEC.md F5)
+# ---------------------------------------------------------------------------
+@router.get("/birthdate-change-requests", response_model=list[BirthdateChangeRequestAdminItem])
+async def list_birthdate_change_requests(
+    status: str = Query("pending", pattern="^(pending|approved|denied)$"),
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """List birthdate-correction requests for admin review (default: pending)."""
+    result = await db.execute(
+        select(BirthdateChangeRequest, User.name)
+        .join(User, User.id == BirthdateChangeRequest.user_id)
+        .where(BirthdateChangeRequest.status == status)
+        .order_by(BirthdateChangeRequest.submitted_at.asc())
+    )
+    items = []
+    for req, user_name in result.all():
+        item = BirthdateChangeRequestAdminItem.model_validate(req)
+        item.user_name = user_name
+        item.user_current_age = compute_age(req.current_birthdate) if req.current_birthdate else None
+        items.append(item)
+    return items
+
+
+@router.post("/birthdate-change-requests/{request_id}/action", response_model=BirthdateChangeRequestAdminItem)
+async def action_birthdate_change_request(
+    request_id: int,
+    body: BirthdateChangeRequestAdminAction,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Approve or deny a pending correction request.
+
+    Approve: atomically updates the user's birthdate + appends an attestation
+    (see age_service.approve_birthdate_change). Defense-in-depth: a sub-18
+    proposed birthdate is rejected with 422 even here, so an admin can never
+    approve an underage account (F5 step 6)."""
+    req = (
+        await db.execute(
+            select(BirthdateChangeRequest).where(BirthdateChangeRequest.id == request_id)
+        )
+    ).scalars().first()
+    if req is None:
+        raise HTTPException(status_code=404, detail="Request not found")
+    if req.status != "pending":
+        raise HTTPException(status_code=400, detail=f"Request already {req.status}")
+
+    if body.action == "approve":
+        try:
+            # validate_birthdate runs first inside approve_birthdate_change, before
+            # any mutation, so a rejection leaves the session untouched (no rollback).
+            req = await approve_birthdate_change(db, req, admin_id=admin.id, note=body.note)
+        except BirthdateValidationError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        logger.info(f"[ADMIN] Admin {admin.id} approved birthdate request {request_id}")
+    else:  # deny
+        req.status = "denied"
+        req.reviewed_by_admin_id = admin.id
+        req.admin_note = body.note
+        req.reviewed_at = datetime.now(timezone.utc)
+        await db.commit()
+        await db.refresh(req)
+        logger.info(f"[ADMIN] Admin {admin.id} denied birthdate request {request_id}")
+
+    item = BirthdateChangeRequestAdminItem.model_validate(req)
+    return item

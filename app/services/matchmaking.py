@@ -3,6 +3,7 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from app.models import User
+from app.services.age_service import birthdate_bounds_for_age_range
 from typing import List, Tuple
 from geopy.distance import geodesic
 import math
@@ -10,10 +11,12 @@ import math
 def calculate_match_score(user1: User, user2: User) -> float:
     score = 0.0
     
-    # Age compatibility (closer ages score higher)
-    age_diff = abs(user1.age - user2.age)
-    age_score = max(0, 1 - (age_diff / 20))  # 20 years difference = 0 score
-    score += age_score * 0.3  # 30% weight
+    # Age compatibility (closer ages score higher). Age is derived from birthdate;
+    # skip the age component if either user has no birthdate set yet.
+    if user1.age is not None and user2.age is not None:
+        age_diff = abs(user1.age - user2.age)
+        age_score = max(0, 1 - (age_diff / 20))  # 20 years difference = 0 score
+        score += age_score * 0.3  # 30% weight
     # Age score calculated
     
     # Location proximity
@@ -58,14 +61,19 @@ async def find_matches(
     if max_distance_km is None:
         max_distance_km = current_user.max_distance_km or 32
 
+    # Age preference → birthdate range (age is derived from birthdate now).
+    _bd_lower, _bd_upper = birthdate_bounds_for_age_range(
+        current_user.min_age_preference, current_user.max_age_preference
+    )
+
     # Get potential matches based on basic criteria - ENHANCED FILTERING
     base_query = select(User).where(
         User.id != user_id,  # Exclude current user
         User.gender.in_([current_user.preferred_gender, "any"]),  # Gender preference
-        User.age.between(current_user.min_age_preference, current_user.max_age_preference),
+        User.birthdate.between(_bd_lower, _bd_upper),  # Age window via birthdate
         # ADDITIONAL FILTERS: Ensure complete profiles only
         User.name.is_not(None),  # Must have a name
-        User.age.is_not(None),   # Must have an age
+        User.birthdate.is_not(None),   # Must have a birthdate (→ age)
         User.gender.is_not(None), # Must have a gender
         User.latitude.is_not(None), # Must have location
         User.longitude.is_not(None)

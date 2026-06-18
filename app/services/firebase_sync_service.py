@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from typing import Dict, Any, Optional
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -10,6 +10,32 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from app.database import SessionLocal
 from app.models import User, Conversation, Message, Match
+
+
+def _birthdate_from_sync(user_data: dict) -> Optional[date]:
+    """Resolve a birthdate from a Firestore user doc. Prefers an explicit
+    `birthdate` (ISO string / date); falls back to the legacy `age` int (mapped
+    to a conservative Jan-1 DOB). Returns None when neither is present. The DB
+    CHECK constraint is the final guard against sub-18 values."""
+    # iOS writes the Firestore key `birthday` (a Timestamp); the API contract
+    # uses `birthdate`. Accept either.
+    bd = user_data.get('birthdate') or user_data.get('birthday')
+    if bd:
+        if isinstance(bd, datetime):
+            return bd.date()
+        if isinstance(bd, date):
+            return bd
+        try:
+            return datetime.strptime(str(bd)[:10], "%Y-%m-%d").date()
+        except Exception:
+            return None
+    age = user_data.get('age')
+    if isinstance(age, int) and age > 0:
+        try:
+            return date(date.today().year - age, 1, 1)
+        except Exception:
+            return None
+    return None
 
 # Initialize Firebase if not already initialized
 try:
@@ -90,7 +116,7 @@ class FirebaseSyncService:
                             email=user_data.get('email') or None,
                             phone_number=user_data.get('phone_number') or user_data.get('phoneNumber') or None,
                             name=user_data.get('name'),
-                            age=user_data.get('age'),
+                            birthdate=_birthdate_from_sync(user_data),
                             gender=user_data.get('gender'),
                             preferred_gender=user_data.get('preferredGender'),
                             min_age_preference=user_data.get('minAgePreference', 18),
@@ -116,7 +142,12 @@ class FirebaseSyncService:
                         _fb_phone = user_data.get('phone_number') or user_data.get('phoneNumber')
                         if _fb_phone:
                             existing_user.phone_number = _fb_phone
-                        existing_user.age = user_data.get('age', existing_user.age)
+                        # Birthdate is set-once; only fill it if Firestore has one
+                        # and Postgres doesn't (never overwrite an existing DOB here).
+                        if existing_user.birthdate is None:
+                            _synced_bd = _birthdate_from_sync(user_data)
+                            if _synced_bd is not None:
+                                existing_user.birthdate = _synced_bd
                         existing_user.gender = user_data.get('gender', existing_user.gender)
                         existing_user.preferred_gender = user_data.get('preferredGender', existing_user.preferred_gender)
                         existing_user.min_age_preference = user_data.get('minAgePreference', existing_user.min_age_preference)

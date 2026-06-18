@@ -1,4 +1,5 @@
 import unittest
+from datetime import date
 from app.services.matchmaking import calculate_match_score
 from app.models import User
 
@@ -11,7 +12,7 @@ class TestMatchmakingSimple(unittest.TestCase):
             id=1,
             email="alice@test.com",
             name="Alice",
-            age=25,
+            birthdate=date(2001, 6, 1),
             gender="female",
             preferred_gender="male",
             interests=["travel", "music", "photography"],
@@ -25,7 +26,7 @@ class TestMatchmakingSimple(unittest.TestCase):
             id=2,
             email="bob@test.com",
             name="Bob",
-            age=27,
+            birthdate=date(1999, 6, 1),
             gender="male",
             preferred_gender="female",
             interests=["travel", "music", "cooking"],
@@ -46,7 +47,7 @@ class TestMatchmakingSimple(unittest.TestCase):
             id=1,
             email="alice@test.com",
             name="Alice",
-            age=25,
+            birthdate=date(2001, 6, 1),
             gender="female",
             preferred_gender="male",
             interests=["travel", "music", "photography"],
@@ -60,7 +61,7 @@ class TestMatchmakingSimple(unittest.TestCase):
             id=3,
             email="charlie@test.com",
             name="Charlie",
-            age=45,  # Much older
+            birthdate=date(1981, 6, 1),  # Much older
             gender="male",
             preferred_gender="female",
             interests=["gaming", "technology", "sports"],
@@ -80,7 +81,7 @@ class TestMatchmakingSimple(unittest.TestCase):
             id=1,
             email="alice@test.com",
             name="Alice",
-            age=25,
+            birthdate=date(2001, 6, 1),
             gender="female",
             preferred_gender="male",
             interests=["travel", "music", "photography"],
@@ -94,7 +95,7 @@ class TestMatchmakingSimple(unittest.TestCase):
             id=2,
             email="bob@test.com",
             name="Bob",
-            age=27,
+            birthdate=date(1999, 6, 1),
             gender="male",
             preferred_gender="female",
             interests=["travel", "music", "cooking"],  # 2 shared interests
@@ -108,7 +109,7 @@ class TestMatchmakingSimple(unittest.TestCase):
             id=3,
             email="charlie@test.com",
             name="Charlie",
-            age=27,
+            birthdate=date(1999, 6, 1),
             gender="male",
             preferred_gender="female",
             interests=["gaming", "technology", "sports"],  # 0 shared interests
@@ -130,7 +131,7 @@ class TestMatchmakingSimple(unittest.TestCase):
             id=1,
             email="alice@test.com",
             name="Alice",
-            age=25,
+            birthdate=date(2001, 6, 1),
             gender="female",
             preferred_gender="male",
             interests=["travel", "music", "photography"],
@@ -144,7 +145,7 @@ class TestMatchmakingSimple(unittest.TestCase):
             id=2,
             email="bob@test.com",
             name="Bob",
-            age=27,
+            birthdate=date(1999, 6, 1),
             gender="male",
             preferred_gender="female",
             interests=["travel", "music", "cooking"],
@@ -158,7 +159,7 @@ class TestMatchmakingSimple(unittest.TestCase):
             id=4,
             email="diana@test.com",
             name="Diana",
-            age=26,
+            birthdate=date(2000, 6, 1),
             gender="female",
             preferred_gender="male",
             interests=["travel", "music", "photography"],
@@ -180,7 +181,7 @@ class TestMatchmakingSimple(unittest.TestCase):
             id=1,
             email="alice@test.com",
             name="Alice",
-            age=25,
+            birthdate=date(2001, 6, 1),
             gender="female",
             preferred_gender="male",
             interests=["travel", "music", "photography"],
@@ -194,7 +195,7 @@ class TestMatchmakingSimple(unittest.TestCase):
             id=2,
             email="bob@test.com",
             name="Bob",
-            age=27,
+            birthdate=date(1999, 6, 1),
             gender="male",
             preferred_gender="female",
             interests=["travel", "music", "cooking"],
