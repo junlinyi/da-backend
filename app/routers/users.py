@@ -128,6 +128,12 @@ async def update_profile(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
+    # NSFW scan a changed profile photo BEFORE persisting (scan-on-change).
+    update_data = profile.dict(exclude_unset=True)
+    new_photo = update_data.get("profileImageURL")
+    if new_photo and new_photo != user.profile_image_url:
+        await moderate_and_log_photos(db, user.id, [new_photo])
+
     # Update only the fields that are provided
     for key, value in profile.dict(exclude_unset=True).items():
         if key == 'location' and isinstance(value, dict):
