@@ -13,6 +13,31 @@ class Gender(str, Enum):
     nonBinary = "nonBinary"
     other = "other"
 
+
+# Account deletion — churn-reason capture (ACCOUNT_DELETION_IOS_SPEC.md DD-5)
+class DeletionReasonKind(str, Enum):
+    found_someone = "found_someone"
+    not_finding_matches = "not_finding_matches"
+    privacy = "privacy"
+    bugs = "bugs"
+    other = "other"
+
+
+class DeletionReasonCreate(BaseModel):
+    """Anonymous churn reason recorded just before account deletion. `free_text`
+    is required only when reason == other (mirrors the DB CHECK constraint)."""
+    reason: DeletionReasonKind
+    free_text: Optional[str] = Field(None, max_length=500)
+
+    @validator("free_text", always=True)
+    def other_requires_free_text(cls, v, values):
+        # always=True so this fires even when free_text is omitted from the body.
+        # `reason` is declared first, so it is already validated and present.
+        if values.get("reason") == DeletionReasonKind.other:
+            if not v or not v.strip():
+                raise ValueError("free_text is required when reason is 'other'")
+        return v
+
 # Location structure to match frontend
 class Location(BaseModel):
     latitude: float = Field(..., ge=-90, le=90)

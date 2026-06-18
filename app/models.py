@@ -625,7 +625,32 @@ class VideoCallRoom(Base):
     
     # Relationships
     scheduled_call = relationship("ScheduledCall", back_populates="video_room")
-    
+
     __table_args__ = (
         CheckConstraint("status IN ('active', 'ended', 'expired')", name='valid_status'),
+    )
+
+
+class DeletionReason(Base):
+    """Append-only churn-reason capture for account deletion.
+
+    Intentionally NOT joined to a user id: once a user deletes their account the
+    user row is PII-scrubbed, so any join would go stale. We store only the
+    reason category + optional free text + timestamp, which keeps this table
+    anonymous and retention-free under GDPR. See ACCOUNT_DELETION_IOS_SPEC.md DD-5.
+    """
+    __tablename__ = "deletion_reasons"
+
+    id = Column(Integer, primary_key=True)
+    reason = Column(String(32), nullable=False)            # see CHECK below
+    free_text = Column(String(500), nullable=True)         # populated only when reason='other'
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "reason IN ('found_someone','not_finding_matches','privacy','bugs','other')",
+            name='deletion_reasons_valid_reason'),
+        CheckConstraint(
+            "reason != 'other' OR (free_text IS NOT NULL AND LENGTH(TRIM(free_text)) >= 1)",
+            name='deletion_reasons_other_requires_text'),
     )
