@@ -5,6 +5,13 @@
 **Status:** Approved design, pending implementation plan
 **Launch tracker:** Phase A submission blocker in `LAUNCH_READINESS.md` ("NSFW photo scan on upload")
 
+## Operational prerequisites (deploy)
+
+- **Enable the Cloud Vision API** on GCP project `facedate-6616e` (Console → APIs & Services → enable "Cloud Vision API"). The existing Firebase service account already has access; no new credentials are needed. **Until enabled, scans fail-open** (`decision=error` logged, photo allowed).
+- **Env vars** (optional; sensible defaults): `PHOTO_SCAN_ENABLED` (default `true`), `PHOTO_SCAN_ADULT_THRESHOLD` (default `LIKELY`), `PHOTO_SCAN_VIOLENCE_THRESHOLD` (default `LIKELY`).
+- **Dependency:** `google-cloud-vision>=3.7.0` (added to `requirements.txt`).
+- **Migration:** `alembic upgrade head` (revision `aa11bb22cc33` — creates `photo_scan_log` and merges the prior two open alembic heads).
+
 ## Problem
 
 The app has no proactive scanning of user-uploaded photos. `app/services/chat_message_filter.py`
