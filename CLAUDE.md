@@ -126,3 +126,9 @@ When running autonomously (headless/queue mode), ALWAYS append a summary of your
 - NEVER force-push to main
 - ALWAYS create a branch for changes
 - ALWAYS test endpoints after changes (use curl or the test scripts)
+
+### Concurrent sessions
+Multiple Claude sessions often work this repo (and `../DatingAppProj`) at the same time. To avoid clobbering each other:
+- **Each session lands its OWN PR to `main`.** `main` merges everyone's work cleanly — prefer small, self-contained PRs over coordinating shared branches.
+- **Only touch your own branch.** Never reset, rebase, or force-push a branch another session may have built on, and don't switch the working tree or delete/clean up branches that aren't yours.
+- The local working tree, checked-out branch, and dev DB are **shared state** — they may shift under you mid-task (branch changes, new alembic merge-point revisions). Re-check `git branch --show-current` / `alembic current` before acting on assumptions; rely on `origin/main` as the source of truth, not the local working tree.
