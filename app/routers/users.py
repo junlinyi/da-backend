@@ -1,6 +1,6 @@
 # app/routers/users.py
 
-from fastapi import APIRouter, Depends, HTTPException, Body
+from fastapi import APIRouter, Depends, HTTPException, Body, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import or_, and_
@@ -8,6 +8,7 @@ from app.database import DATABASE_URL, get_db
 from app.models import User, Match, Conversation
 from app.schemas import UserResponse, UserUpdate, ProfileUpdate, PreferencesUpdate
 from app.dependencies import verify_firebase_token
+from app.limiter import limiter
 from pydantic import BaseModel, validator
 from typing import Optional
 import logging
@@ -214,8 +215,32 @@ async def update_user_by_id(user_id: int, profile: UserUpdate, decoded_token=Dep
     await db.commit()
     return user
 
+async def deactivate_user_conversations(db: AsyncSession, user_id: int):
+    """Deactivate every conversation the user participates in (either side).
+
+    Generalises the block flow's single-conversation deactivation (see
+    block_user below) to all of a user's conversations on account deletion.
+    Firestore conversation docs are archived separately in delete_account.
+    """
+    result = await db.execute(
+        select(Conversation).where(
+            or_(Conversation.user1_id == user_id, Conversation.user2_id == user_id)
+        )
+    )
+    for conv in result.scalars().all():
+        conv.is_active = False
+
+
 @router.delete("/{user_id}")
-async def delete_account(user_id: int, decoded_token=Depends(verify_firebase_token), db: AsyncSession = Depends(get_db)):
+@limiter.limit("3/hour")
+async def delete_account(user_id: int, request: Request, decoded_token=Depends(verify_firebase_token), db: AsyncSession = Depends(get_db)):
+    """Permanently delete the caller's own account: soft-delete the row, scrub
+    all PII to satisfy GDPR Art. 17, and deactivate their conversations.
+
+    Idempotent: the `deleted_at IS NULL` filter makes a second DELETE return 404.
+    The Firebase Auth user is deleted client-side after this succeeds (the
+    backend is the source of truth — see ACCOUNT_DELETION_IOS_SPEC.md DD-6).
+    """
     from datetime import datetime, timezone
     result = await db.execute(select(User).where(User.id == user_id, User.deleted_at.is_(None)))
     user = result.scalars().first()
@@ -226,20 +251,46 @@ async def delete_account(user_id: int, decoded_token=Depends(verify_firebase_tok
     if user.firebase_uid != decoded_token["uid"]:
         raise HTTPException(status_code=403, detail="Not authorized to delete this user")
 
-    # Soft delete: stamp deleted_at and scrub PII (GDPR)
+    # Soft delete: stamp deleted_at and scrub every PII column, leaving only the
+    # synthetic id + timestamps + strikes (moderation audit). GDPR Art. 17.
     now = datetime.now(timezone.utc)
     user.deleted_at = now
     user.is_active = False
+    user.firebase_uid = f"deleted:{user.id}"        # column is NOT NULL — synthetic, not null
     user.email = f"deleted_{user.id}@deleted.invalid"
     user.phone_number = f"deleted_{user.id}_phone"
+    user.phone_country_code = None
     user.name = "Deleted User"
     user.bio = None
     user.profile_image_url = None
     user.additional_image_urls = None
     user.location = None
+    user.state = None
     user.latitude = None
     user.longitude = None
     user.prompts = None
+    user.gender = None
+    user.preferred_gender = None
+    user.min_age_preference = None
+    user.max_age_preference = None
+    user.interests = []
+    user.device_token = None
+
+    # Age/DOB — defensive across the AGE_VERIFICATION_SPEC merge (spec Open Q #6):
+    #   pre-merge  -> `age` is a settable column            -> null it
+    #   post-merge -> `age` becomes a read-only computed property and `birthdate`
+    #                 is the settable source of truth        -> null `birthdate`
+    #   (post-merge also delete this user's age_attestations / birthdate_change_requests
+    #    rows here — they hold DOB keyed to user_id.)
+    if isinstance(getattr(type(user), "age", None), property):
+        if hasattr(user, "birthdate"):
+            user.birthdate = None
+    else:
+        user.age = None
+
+    # Deactivate all of the user's conversations (Postgres side).
+    await deactivate_user_conversations(db, user.id)
+
     await db.commit()
     return {"message": "User deleted successfully"}
 

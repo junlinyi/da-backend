@@ -36,3 +36,18 @@
 **Summary:** Wrote and verified the idempotent V2 seed (runs clean twice). Ran the full backend test sweep across the 10 V2 suites: 112 passed. `import app.main` boots clean. This caps the V2 backend build on feature/scheduling-v2 (schema migration: matches text_state/call_status/lifecycle + lock/expiry/exit-survey/contact-reveal columns, video_call_proposals + no_show_events tables, scheduled_calls join flags, legacy tables dropped; the match state machine + endpoints; messaging gate; expiry/lock/nudge/expiring-soon crons; V2 push notifications; Twilio video-room hooks; legacy scheduling/call-request removal; and now the seed).
 **Status:** completed
 ---
+
+## 2026-06-17 Task: Account-deletion backend — GDPR scrub tightening + deletion_reasons (ACCOUNT_DELETION_IOS_SPEC)
+**Branch:** feature/account-deletion (worktree off HEAD; isolated from uncommitted age-verification WIP)
+**Files Modified:**
+- `app/routers/users.py` — expanded `delete_account` scrub to all PII (firebase_uid→synthetic, gender/prefs/interests/device_token/phone_country_code/state, defensive age-vs-birthdate branch) + new `deactivate_user_conversations` helper + 3/hour rate limit (`request: Request`).
+- `app/models.py` — `DeletionReason` model (anonymous, no user id; CHECK constraints + created_at index).
+- `app/schemas.py` — `DeletionReasonKind` enum + `DeletionReasonCreate` (other-requires-free_text validator, always=True).
+- `app/routers/deletion_reasons.py` (new) — `POST /deletion-reasons` (204, 1/minute, verify_firebase_token, user id NOT persisted).
+- `app/main.py` — register deletion_reasons router.
+- `alembic/versions/c4d5e6del01_add_deletion_reasons_table.py` (new) — down_revision a1b2c3scjf01.
+- `tests/test_users_delete.py` + `tests/test_deletion_reasons.py` (new) — 14 tests.
+
+**Summary:** Tightened the DELETE /users/{id} PII scrub to GDPR Art. 17 (all PII nulled, only synthetic id+timestamps+strikes kept), added all-conversation deactivation, and added anonymous churn-reason capture. 14 new tests pass; 120 canonical V2/reporting-PG tests still green (the 6 SQLite test_reporting errors are pre-existing, ARRAY-on-SQLite, unrelated).
+**Status:** completed (code + tests green). Age-verification merge follow-up: switch scrub to `birthdate` + delete `age_attestations`/`birthdate_change_requests` rows (spec Open Q #6).
+---

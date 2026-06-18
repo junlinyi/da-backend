@@ -60,6 +60,7 @@ logger = logging.getLogger(__name__)
 from app.routers import auth, users, matchmaking, sync, messaging, scheduling, video_calls, reporting, admin
 from app.routers import questionnaire
 from app.routers import matches
+from app.routers import deletion_reasons
 from app.services.firebase_sync_service import start_background_sync, stop_background_sync
 from app.services.scheduling_monitor_service import start_scheduling_monitor, stop_scheduling_monitor, start_fast_monitor
 
@@ -153,6 +154,7 @@ app.include_router(reporting.router, prefix="/reports", tags=["Reporting"])
 app.include_router(admin.router, prefix="/admin", tags=["Admin"])
 app.include_router(questionnaire.router, prefix="/questionnaire", tags=["Questionnaire"])
 app.include_router(matches.router)
+app.include_router(deletion_reasons.router, tags=["Account Deletion"])
 
 def _validate_required_env_vars() -> None:
     """Raise RuntimeError on startup if critical environment variables are missing.
