@@ -12,6 +12,9 @@ FastAPI backend for the dating app. iOS frontend is at `../DatingAppProj/`.
 - **Chat**: **Firestore-authoritative** for real-time delivery + push; Postgres `messages` is an analytics mirror (see Scheduling V2 below)
 - **Validation**: Pydantic v2
 
+## Age Verification (18+ — shipped 2026-06)
+Canonical spec: [`../DatingAppProj/AGE_VERIFICATION_SPEC.md`](../DatingAppProj/AGE_VERIFICATION_SPEC.md) (read its **As-Built** section before touching this). The bare `users.age` int was replaced by `users.birthdate: Date` (nullable for pre-onboarding rows; CHECK enforces 18+/sane when set). **Age is derived on read** via the `User.age` ORM `@property` — never query `User.age` in SQL; use `User.birthdate` + `age_service.birthdate_bounds_for_age_range()`. All age math/validation lives in [`app/services/age_service.py`](app/services/age_service.py). Birthdate is **set-once** at signup (`POST /users/create` writes an `age_attestations` row); changes go through admin-reviewed `birthdate_change_requests` ([`routers/birthdate_change_requests.py`](app/routers/birthdate_change_requests.py) user-facing + `routers/admin.py` review endpoints). The legacy `age` column is still physically in the DB pending a follow-up `DROP COLUMN` migration. Tables: `age_attestations` (append-only audit), `birthdate_change_requests`.
+
 ## Scheduling (V2 — current, shipped 2026-06)
 The scheduling system is **SCHEDULING_V2** (canonical spec: [`../DatingAppProj/SCHEDULING_V2.md`](../DatingAppProj/SCHEDULING_V2.md), with an "As-Built" section documenting how the implementation diverged from the spec). It **replaced** the legacy two-tier system (Tier-1 immediate `call_requests` + Tier-2 `scheduling_proposals`), which is fully removed. The old availability-grid design doc `scheduling_design.md` is **superseded/dead**.
 

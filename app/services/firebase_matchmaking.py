@@ -218,11 +218,13 @@ class FirebaseMatchmakingService:
     def _calculate_match_score(self, user1: User, user2: User) -> float:
         """Calculate match score between two users"""
         score = 0.0
-        
-        # Age compatibility (closer ages score higher)
-        age_diff = abs(user1.age - user2.age)
-        age_score = max(0, 1 - (age_diff / 20))  # 20 years difference = 0 score
-        score += age_score * 0.3  # 30% weight
+
+        # Age compatibility (closer ages score higher). Age derives from birthdate;
+        # skip the age component if either user has no birthdate set yet.
+        if user1.age is not None and user2.age is not None:
+            age_diff = abs(user1.age - user2.age)
+            age_score = max(0, 1 - (age_diff / 20))  # 20 years difference = 0 score
+            score += age_score * 0.3  # 30% weight
         
         # Location proximity
         if user1.latitude and user1.longitude and user2.latitude and user2.longitude:

@@ -40,6 +40,29 @@ class _JsonFormatter(logging.Formatter):
             payload["exc"] = self.formatException(record.exc_info)
         return json.dumps(payload)
 
+import re as _re
+
+class _RedactBirthdateFilter(logging.Filter):
+    """Birthdate is PII (AGE_VERIFICATION_SPEC.md Security Review). We never log it
+    intentionally, but this filter is a backstop: it masks any value attached to a
+    `birthdate` / `proposed_birthdate` / `current_birthdate` key in a log message,
+    without touching unrelated dates (created_at, scheduled times, etc.)."""
+    _PATTERN = _re.compile(
+        r"((?:proposed_|current_)?birthdate)"      # the key
+        r"(['\"]?\s*[=:]\s*['\"]?)"                 # = or : with optional quotes
+        r"\d{4}-\d{2}-\d{2}"                        # the ISO date value
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+            if "birthdate" in msg:
+                record.msg = self._PATTERN.sub(r"\1\2<redacted>", msg)
+                record.args = ()
+        except Exception:
+            pass
+        return True
+
 _handler = logging.StreamHandler(sys.stdout)
 if _log_env == "production":
     _handler.setFormatter(_JsonFormatter())
@@ -48,6 +71,7 @@ else:
         "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     ))
+_handler.addFilter(_RedactBirthdateFilter())
 
 logging.root.setLevel(_log_level)
 logging.root.handlers = [_handler]
@@ -60,6 +84,7 @@ logger = logging.getLogger(__name__)
 from app.routers import auth, users, matchmaking, sync, messaging, scheduling, video_calls, reporting, admin
 from app.routers import questionnaire
 from app.routers import matches
+from app.routers import birthdate_change_requests
 from app.services.firebase_sync_service import start_background_sync, stop_background_sync
 from app.services.scheduling_monitor_service import start_scheduling_monitor, stop_scheduling_monitor, start_fast_monitor
 
@@ -144,6 +169,7 @@ app.add_middleware(
 # Include routers
 app.include_router(auth.router, prefix="/auth", tags=["Authentication"])
 app.include_router(users.router, prefix="/users", tags=["Users"])
+app.include_router(birthdate_change_requests.router, prefix="/users", tags=["Age Verification"])
 app.include_router(matchmaking.router, prefix="/matchmaking", tags=["Matchmaking"])
 app.include_router(sync.router, prefix="/sync", tags=["Sync"])
 app.include_router(messaging.router, prefix="/messaging", tags=["Messaging"])
