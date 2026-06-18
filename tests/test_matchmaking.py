@@ -1,5 +1,5 @@
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from firebase_admin import firestore, initialize_app, credentials
 import os
 from pathlib import Path
@@ -18,7 +18,7 @@ from app.models import User
 
 # Add this helper at the top (after imports)
 USER_FIELDS = [
-    'id', 'email', 'is_active', 'firebase_uid', 'name', 'bio', 'age', 'gender', 'interests', 'location',
+    'id', 'email', 'is_active', 'firebase_uid', 'name', 'bio', 'birthdate', 'gender', 'interests', 'location',
     'latitude', 'longitude', 'preferred_gender', 'min_age_preference', 'max_age_preference', 'max_distance_km',
     'last_active', 'profile_completed', 'is_verified', 'profile_image_url', 'additional_image_urls'
 ]
@@ -47,7 +47,7 @@ class TestMatchmaking(unittest.TestCase):
                 'id': 'test_user_1',
                 'name': 'Alice',
                 'email': 'alice@test.com',
-                'age': 25,
+                'birthdate': date(2001, 6, 1),
                 'gender': 'female',
                 'preferredGender': 'male',
                 'interests': ['travel', 'music', 'photography'],
@@ -67,7 +67,7 @@ class TestMatchmaking(unittest.TestCase):
                 'id': 'test_user_2',
                 'name': 'Bob',
                 'email': 'bob@test.com',
-                'age': 27,
+                'birthdate': date(1999, 6, 1),
                 'gender': 'male',
                 'preferredGender': 'female',
                 'interests': ['travel', 'music', 'cooking'],
@@ -87,7 +87,7 @@ class TestMatchmaking(unittest.TestCase):
                 'id': 'test_user_3',
                 'name': 'Charlie',
                 'email': 'charlie@test.com',
-                'age': 35,
+                'birthdate': date(1991, 6, 1),
                 'gender': 'male',
                 'preferredGender': 'female',
                 'interests': ['gaming', 'technology', 'sports'],
@@ -156,7 +156,7 @@ class TestMatchmaking(unittest.TestCase):
             'firebase_uid': 'test_user_4_uid',
             'name': 'Diana',
             'bio': '',
-            'age': 26,
+            'birthdate': date(2000, 6, 1),
             'gender': 'female',
             'interests': ['travel', 'music', 'photography'],
             'location': 'New York',

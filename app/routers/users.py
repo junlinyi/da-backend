@@ -3,13 +3,15 @@
 from fastapi import APIRouter, Depends, HTTPException, Body, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import or_, and_
+from sqlalchemy import or_, and_, delete
 from app.database import DATABASE_URL, get_db
-from app.models import User, Match, Conversation
+from app.models import User, Match, Conversation, AgeAttestation, BirthdateChangeRequest
 from app.schemas import UserResponse, UserUpdate, ProfileUpdate, PreferencesUpdate
 from app.dependencies import verify_firebase_token
 from app.limiter import limiter
+from app.services.age_service import validate_birthdate, record_attestation, BirthdateValidationError
 from pydantic import BaseModel, validator
+from datetime import date
 from typing import Optional
 import logging
 
@@ -25,7 +27,7 @@ class UserCreateRequest(BaseModel):
     phone_number: Optional[str] = None
     name: Optional[str] = None
     bio: Optional[str] = None
-    age: Optional[int] = None
+    birthdate: Optional[date] = None  # replaces `age`; 18+ enforced below
     gender: Optional[str] = None
     interests: Optional[str] = None  # Will be converted to array
     location: Optional[str] = None
@@ -44,6 +46,15 @@ class UserCreateRequest(BaseModel):
     def require_email_or_phone(cls, v, values):
         if not v and not values.get('email'):
             raise ValueError('Either email or phone_number must be provided')
+        return v
+
+    @validator('birthdate')
+    def birthdate_must_be_18_plus(cls, v):
+        if v is not None:
+            try:
+                validate_birthdate(v)
+            except BirthdateValidationError as e:
+                raise ValueError(str(e))
         return v
 
     def to_user_dict(self):
@@ -276,17 +287,14 @@ async def delete_account(user_id: int, request: Request, decoded_token=Depends(v
     user.interests = []
     user.device_token = None
 
-    # Age/DOB — defensive across the AGE_VERIFICATION_SPEC merge (spec Open Q #6):
-    #   pre-merge  -> `age` is a settable column            -> null it
-    #   post-merge -> `age` becomes a read-only computed property and `birthdate`
-    #                 is the settable source of truth        -> null `birthdate`
-    #   (post-merge also delete this user's age_attestations / birthdate_change_requests
-    #    rows here — they hold DOB keyed to user_id.)
-    if isinstance(getattr(type(user), "age", None), property):
-        if hasattr(user, "birthdate"):
-            user.birthdate = None
-    else:
-        user.age = None
+    # DOB scrub (GDPR Art. 17). Post age-verification, `birthdate` is the settable
+    # source of truth (`age` is a read-only computed property), and DOB is also
+    # mirrored into the append-only age-verification audit trail keyed to user_id.
+    # Null the row's birthdate AND delete the user's attestation / change-request
+    # rows so no DOB survives anywhere (ACCOUNT_DELETION_IOS_SPEC.md Open Q #6).
+    user.birthdate = None
+    await db.execute(delete(AgeAttestation).where(AgeAttestation.user_id == user.id))
+    await db.execute(delete(BirthdateChangeRequest).where(BirthdateChangeRequest.user_id == user.id))
 
     # Deactivate all of the user's conversations (Postgres side).
     await deactivate_user_conversations(db, user.id)
@@ -445,20 +453,46 @@ async def create_user(
     try:
         result = await db.execute(select(User).where(User.firebase_uid == user.firebase_uid))
         db_user = result.scalars().first()
+        user_data = user.to_user_dict()
+        incoming_birthdate = user_data.get('birthdate')
+
         if db_user:
             logger.info(f"[USER CREATE] User already exists, updating: {db_user.id}")
-            user_data = user.to_user_dict()
+            # Birthdate is set once. Reject attempts to CHANGE an already-set
+            # birthdate via this path — corrections go through the admin-reviewed
+            # request flow (AGE_VERIFICATION_SPEC.md F4, DD-4).
+            if (
+                incoming_birthdate is not None
+                and db_user.birthdate is not None
+                and incoming_birthdate != db_user.birthdate
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Your birthday is already set and can't be changed here. "
+                           "Use the birthday-correction request to fix it.",
+                )
+            birthdate_newly_set = incoming_birthdate is not None and db_user.birthdate is None
             for key, value in user_data.items():
                 setattr(db_user, key, value)
         else:
-            user_data = user.to_user_dict()
             db_user = User(**user_data)
             db.add(db_user)
+            birthdate_newly_set = incoming_birthdate is not None
             logger.info(f"[USER CREATE] New user will be created: {user.firebase_uid}")
+
+        # Flush so a brand-new user gets its PK before we write the attestation.
+        await db.flush()
+        if birthdate_newly_set:
+            await record_attestation(db, db_user.id, incoming_birthdate, source="signup")
+
         await db.commit()
         await db.refresh(db_user)
         logger.info(f"[USER CREATE] User created/updated successfully: {db_user.id}")
         return db_user
+    except HTTPException:
+        await db.rollback()
+        raise
     except Exception as e:
+        await db.rollback()
         logger.error(f"[USER CREATE] Error creating/updating user: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to create/update user: {e}")

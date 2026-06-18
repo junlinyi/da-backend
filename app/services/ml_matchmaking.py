@@ -48,6 +48,7 @@ from geopy.distance import geodesic
 
 from app.models import User, Swipe, Conversation, Report, UserValues
 from app.services.feature_service import get_feature_vector
+from app.services.age_service import birthdate_bounds_for_age_range
 
 logger = logging.getLogger(__name__)
 
@@ -500,15 +501,17 @@ async def find_matches_ml(
     gender_filter = [user.preferred_gender] if user.preferred_gender and user.preferred_gender != "any" else None
     min_age = user.min_age_preference or 18
     max_age = user.max_age_preference or 120
+    # Age preference → birthdate range (age is derived from birthdate now).
+    _bd_lower, _bd_upper = birthdate_bounds_for_age_range(min_age, max_age)
 
     candidate_q = select(User).where(
         User.id.not_in(exclude_ids),
         User.profile_completed == True,   # DB-03: only show complete profiles
         User.is_active == True,
         User.name.is_not(None),
-        User.age.is_not(None),
+        User.birthdate.is_not(None),
         User.gender.is_not(None),
-        User.age.between(min_age, max_age),
+        User.birthdate.between(_bd_lower, _bd_upper),
     )
     if gender_filter:
         candidate_q = candidate_q.where(

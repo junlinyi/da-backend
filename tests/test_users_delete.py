@@ -3,6 +3,7 @@ conversation deactivation. Runs against the Postgres harness (conftest_pg.py)
 so ARRAY columns and real constraints behave as in production.
 """
 import pytest
+from datetime import date
 from httpx import AsyncClient, ASGITransport
 from sqlalchemy import select
 
@@ -42,7 +43,7 @@ async def test_delete_scrubs_all_pii(db, make_user):
     u.state = "CA"
     u.latitude = 37.7
     u.longitude = -122.4
-    u.age = 25
+    u.birthdate = date(2000, 1, 1)   # age is a computed property post age-verification
     u.preferred_gender = "female"
     u.min_age_preference = 21
     u.max_age_preference = 40
@@ -77,7 +78,8 @@ async def test_delete_scrubs_all_pii(db, make_user):
     assert row.profile_image_url is None
     assert row.additional_image_urls is None
     assert row.prompts is None
-    # Defensive age branch: pre-merge `age` is a settable column, so it is nulled.
+    # DOB scrubbed: birthdate nulled, and the derived `age` property follows.
+    assert row.birthdate is None
     assert row.age is None
 
 
@@ -130,3 +132,27 @@ async def test_delete_deactivates_all_user_conversations(db, make_user):
     assert rows[ab_id] is False
     assert rows[ca_id] is False
     assert rows[bc_id] is True  # conversation a is not part of stays active
+
+
+async def test_delete_removes_age_verification_dob_rows(db, make_user):
+    """GDPR Open Q#6: deletion removes the user's DOB from the age-verification
+    audit trail (age_attestations + birthdate_change_requests), not just the row."""
+    u = await make_user(name="Dee", firebase_uid="uid_dee")
+    uid = u.id
+    db.add(models.AgeAttestation(user_id=uid, birthdate=date(1999, 5, 5), source="signup"))
+    db.add(models.BirthdateChangeRequest(
+        user_id=uid, current_birthdate=date(1999, 5, 5),
+        proposed_birthdate=date(1998, 5, 5), reason="typo fix", status="pending"))
+    await db.commit()
+
+    async with _client(db, "uid_dee") as c:
+        r = await c.delete(f"/users/{uid}")
+    assert r.status_code == 200, r.text
+
+    db.expire_all()
+    att = (await db.execute(
+        select(models.AgeAttestation).where(models.AgeAttestation.user_id == uid))).scalars().all()
+    req = (await db.execute(
+        select(models.BirthdateChangeRequest).where(models.BirthdateChangeRequest.user_id == uid))).scalars().all()
+    assert att == [], "age_attestations must be deleted on account deletion (GDPR Art. 17)"
+    assert req == [], "birthdate_change_requests must be deleted on account deletion"

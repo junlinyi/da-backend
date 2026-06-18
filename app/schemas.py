@@ -60,7 +60,8 @@ class UserResponse(BaseModel):
     email: Optional[str] = None
     phone_number: Optional[str] = None
     name: Optional[str] = None
-    age: Optional[int] = None
+    age: Optional[int] = None          # computed server-side from birthdate (DD-5)
+    birthdate: Optional[date] = None   # the user's own DOB; shown only in their Edit Profile
     bio: Optional[str] = None
     gender: Optional[str] = None
     interests: Optional[List[str]] = None
@@ -83,16 +84,28 @@ class UserResponse(BaseModel):
     is_admin: Optional[bool] = None
     prompts: Optional[List[dict]] = None
 
-# Profile update schema - used by iOS app for /me/profile endpoint
+# Profile update schema - used by iOS app for /me/profile endpoint.
+# Birthdate is NOT accepted here — it is set once at signup and changed only via
+# the admin-reviewed correction flow (AGE_VERIFICATION_SPEC.md F4). The `age`
+# field is retained solely to reject stale clients with a clear message (DD-5).
 class ProfileUpdate(BaseModel):
     name: Optional[str] = Field(None, max_length=100)
     bio: Optional[str] = Field(None, max_length=1000)
-    age: Optional[int] = Field(None, ge=18, le=100)
+    age: Optional[int] = None
     gender: Optional[Gender] = None
     interests: Optional[List[str]] = None
     location: Optional[Location] = None
     profileImageURL: Optional[str] = None
     prompts: Optional[List[dict]] = None
+
+    @validator('age')
+    def age_is_not_updatable(cls, v):
+        if v is not None:
+            raise ValueError(
+                "Age is derived from your birthday and can't be edited here. "
+                "To correct your birthday, use the birthday-correction request."
+            )
+        return v
 
 # Preferences update schema - used by iOS app for /me/preferences endpoint
 class PreferencesUpdate(BaseModel):
@@ -323,7 +336,7 @@ class UserBase(BaseModel):
     phone_number: Optional[str] = Field(None, max_length=32)
     name: Optional[str] = Field(None, max_length=100)
     bio: Optional[str] = Field(None, max_length=1000)
-    age: Optional[int] = Field(None, ge=18, le=120)
+    birthdate: Optional[date] = None
     gender: Optional[str] = None
     interests: Optional[List[str]] = None
     location: Optional[str] = Field(None, max_length=200)
@@ -340,6 +353,16 @@ class UserBase(BaseModel):
     strikes: int = Field(0, ge=0)
     timezone: str = "UTC"
 
+    @validator('birthdate')
+    def birthdate_must_be_18_plus(cls, v):
+        if v is not None:
+            from app.services.age_service import validate_birthdate, BirthdateValidationError
+            try:
+                validate_birthdate(v)
+            except BirthdateValidationError as e:
+                raise ValueError(str(e))
+        return v
+
 class UserCreate(UserBase):
     firebase_uid: str
 
@@ -352,7 +375,6 @@ class UserCreate(UserBase):
 class UserUpdate(BaseModel):
     name: Optional[str] = Field(None, max_length=100)
     bio: Optional[str] = Field(None, max_length=1000)
-    age: Optional[int] = Field(None, ge=18, le=120)
     gender: Optional[str] = None
     interests: Optional[List[str]] = None
     location: Optional[str] = Field(None, max_length=200)
@@ -698,3 +720,53 @@ class VideoCallRoomStatusResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+# ---------------------------------------------------------------------------
+# Birthdate correction requests (AGE_VERIFICATION_SPEC.md F4/F5)
+# ---------------------------------------------------------------------------
+class BirthdateChangeRequestCreate(BaseModel):
+    """User-submitted correction request. 18+ is enforced server-side via the
+    age_service validator below as well as a DB CHECK constraint."""
+    proposed_birthdate: date
+    reason: str = Field(..., min_length=1, max_length=500)
+
+    @validator('proposed_birthdate')
+    def proposed_must_be_18_plus(cls, v):
+        from app.services.age_service import validate_birthdate, BirthdateValidationError
+        try:
+            validate_birthdate(v)
+        except BirthdateValidationError as e:
+            raise ValueError(str(e))
+        return v
+
+
+class BirthdateChangeRequestResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    user_id: int
+    current_birthdate: date
+    proposed_birthdate: date
+    reason: str
+    status: str
+    admin_note: Optional[str] = None
+    submitted_at: datetime
+    reviewed_at: Optional[datetime] = None
+
+
+class BirthdateChangeRequestAdminItem(BirthdateChangeRequestResponse):
+    """Admin list item — adds the minimal user context an admin needs to triage."""
+    user_name: Optional[str] = None
+    user_current_age: Optional[int] = None
+
+
+class BirthdateChangeRequestAdminAction(BaseModel):
+    action: str  # 'approve' | 'deny'
+    note: Optional[str] = Field(None, max_length=500)
+
+    @validator('action')
+    def action_must_be_valid(cls, v):
+        if v not in ('approve', 'deny'):
+            raise ValueError("action must be 'approve' or 'deny'")
+        return v

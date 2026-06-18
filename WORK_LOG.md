@@ -50,4 +50,20 @@
 
 **Summary:** Tightened the DELETE /users/{id} PII scrub to GDPR Art. 17 (all PII nulled, only synthetic id+timestamps+strikes kept), added all-conversation deactivation, and added anonymous churn-reason capture. 14 new tests pass; 120 canonical V2/reporting-PG tests still green (the 6 SQLite test_reporting errors are pre-existing, ARRAY-on-SQLite, unrelated).
 **Status:** completed (code + tests green). Age-verification merge follow-up: switch scrub to `birthdate` + delete `age_attestations`/`birthdate_change_requests` rows (spec Open Q #6).
+## 2026-06-17 Task: Age-verification hardening (backend)
+**Branch:** feature/age-verification-hardening
+**Files Modified:**
+- `alembic/versions/b2c3d4age01_birthdate_and_age_attestations.py` — new: birthdate column (nullable+CHECK), backfill, age_attestations + birthdate_change_requests tables
+- `app/models.py` — birthdate column, `User.age` @property, AgeAttestation + BirthdateChangeRequest ORM
+- `app/services/age_service.py` — new: compute_age, validate_birthdate, birthdate_bounds_for_age_range, record_attestation, approve_birthdate_change
+- `app/schemas.py` — birthdate on create/UserBase, computed age on UserResponse, age rejected on ProfileUpdate, new request schemas
+- `app/routers/users.py` — accept birthdate (set-once) + write attestation
+- `app/routers/birthdate_change_requests.py` — new: user-facing correction request POST/GET
+- `app/routers/admin.py` — list + approve/deny correction requests (re-validates 18+ on approve)
+- `app/services/{matchmaking,ml_matchmaking,firebase_matchmaking,firebase_sync_service}.py` — switched SQL/instance age reads to birthdate
+- `app/main.py` — register router + birthdate log-redaction filter
+- `tests/test_age_service.py`, `tests/test_birthdate_change_requests.py` — new (22 tests); migrated legacy matchmaking fixtures to birthdate
+
+**Summary:** Replaced bare `age:int` with stored `birthdate` (age derived on read), enforced 18+ on every write path + DB CHECK, added append-only age_attestations audit trail and admin-reviewed birthdate-correction flow. Migration applied to dev DB. 22 new tests green; full suite 0 regressions vs baseline. As-Built deviations (nullable birthdate, set-once via POST /users/create) documented in AGE_VERIFICATION_SPEC.md.
+**Status:** completed (follow-up: drop legacy `users.age` column after deploy; apply migration to staging/prod)
 ---

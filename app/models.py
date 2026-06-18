@@ -17,7 +17,12 @@ class User(Base):
     # Profile Fields
     name = Column(String, nullable=True)
     bio = Column(Text, nullable=True)
-    age = Column(Integer, nullable=True)
+    # Age verification: birthdate is the source of truth; `age` is derived on read
+    # via the property below. Nullable because rows are bootstrapped before
+    # onboarding collects the DOB (see AGE_VERIFICATION_SPEC.md). The legacy `age`
+    # column still exists in the DB but is no longer mapped here — it is dropped in
+    # a follow-up migration once all readers use the property.
+    birthdate = Column(Date, nullable=True, index=True)
     gender = Column(String, nullable=True)
     interests = Column(ARRAY(String), nullable=True)  # Array of interests
     location = Column(String, nullable=True)  # City name
@@ -80,6 +85,52 @@ class User(Base):
     __table_args__ = (
         Index("idx_users_no_show_count", "no_show_count", postgresql_where=text("no_show_count > 0")),
     )
+
+    @property
+    def age(self) -> "int | None":
+        """Computed age derived from birthdate. Preserves the existing read API
+        (UserResponse, matchmaking instance reads) without a stored `age` column.
+        Returns None when birthdate is unset (pre-onboarding rows)."""
+        if self.birthdate is None:
+            return None
+        today = date.today()
+        return today.year - self.birthdate.year - (
+            (today.month, today.day) < (self.birthdate.month, self.birthdate.day)
+        )
+
+
+class AgeAttestation(Base):
+    """Append-only audit trail: one row per birthdate ever persisted to a user
+    account (signup, each admin-approved correction, and the pre-launch backfill).
+    See AGE_VERIFICATION_SPEC.md DD-7."""
+    __tablename__ = "age_attestations"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    birthdate = Column(Date, nullable=False)
+    source = Column(String(32), nullable=False)  # 'signup' | 'admin_approved_change' | 'backfill'
+    admin_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    change_request_id = Column(
+        Integer, ForeignKey("birthdate_change_requests.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+
+
+class BirthdateChangeRequest(Base):
+    """User-submitted request to correct an immutable birthdate; admin-reviewed.
+    See AGE_VERIFICATION_SPEC.md F4/F5."""
+    __tablename__ = "birthdate_change_requests"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    current_birthdate = Column(Date, nullable=False)
+    proposed_birthdate = Column(Date, nullable=False)
+    reason = Column(String(500), nullable=False)
+    status = Column(String(16), nullable=False, default="pending", index=True)  # pending|approved|denied
+    admin_note = Column(String(500), nullable=True)
+    reviewed_by_admin_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    submitted_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    reviewed_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class Match(Base):
