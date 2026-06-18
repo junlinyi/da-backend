@@ -17,3 +17,4 @@ twilio>=8.10.0
 pytz>=2024.1
 sentry-sdk[fastapi]>=2.0.0
 slowapi>=0.1.9
+google-cloud-vision>=3.7.0
