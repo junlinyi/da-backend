@@ -1,5 +1,10 @@
 # Video Call Scheduling System Design (Simplified)
 
+> **⚠️ SUPERSEDED & DEAD (as of 2026-06).** This describes a recurring weekly-availability / date-override grid (When2Meet-style) with `user_weekly_availability` / `user_availability_overrides` tables — **none of which exist anymore**. It was superseded first by the legacy two-tier system and then entirely by **SCHEDULING_V2** (24h text window + single-scheduler video date). The canonical, as-built technical reference is [`../DatingAppProj/SCHEDULING_V2.md`](../DatingAppProj/SCHEDULING_V2.md) and the backend overview in [`CLAUDE.md`](CLAUDE.md) (Scheduling V2 section). **Do not implement against this document.** Retained for historical context only.
+
+---
+
+
 ## Core Principles
 
 ### 1. **Fixed 15-Minute Calls**
