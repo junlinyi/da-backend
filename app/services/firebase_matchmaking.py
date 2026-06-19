@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from app.models import User, Swipe, Conversation
 from app.dependencies import verify_firebase_token
+from app.services import match_state_service as mss
 
 logger = logging.getLogger(__name__)
 
@@ -18,9 +19,19 @@ class FirebaseMatchmakingService:
     """
     Real-time matchmaking service using Firebase for live data
     """
-    
+
     def __init__(self):
         self.firestore_db = firestore.client()
+
+    @staticmethod
+    def _distance_miles(user_a: User, user_b: User) -> Optional[int]:
+        """Whole-miles distance between two users, or None if either lacks coords."""
+        if not (user_a.latitude and user_a.longitude and user_b.latitude and user_b.longitude):
+            return None
+        return round(geodesic(
+            (user_a.latitude, user_a.longitude),
+            (user_b.latitude, user_b.longitude),
+        ).miles)
         
     async def get_potential_matches_realtime(
         self, 
@@ -56,6 +67,11 @@ class FirebaseMatchmakingService:
             
             # Get users who are already matched (from Firebase for real-time)
             matched_user_ids = self._get_matched_user_ids(user_firebase_uid, firebase_matches)
+
+            # Postgres user ids this user has unmatched (terminated match) — kept
+            # out of Discover so they don't resurface or re-match. The Firebase
+            # `matches` collection above doesn't reflect terminations.
+            terminated_user_ids = await mss.get_terminated_match_user_ids(db, current_user.id)
             
             # Filter and score potential matches
             potential_matches = []
@@ -75,6 +91,10 @@ class FirebaseMatchmakingService:
                     
                 # Skip if already matched
                 if pg_user.firebase_uid in matched_user_ids:
+                    continue
+
+                # Skip if previously unmatched (terminated match)
+                if pg_user.id in terminated_user_ids:
                     continue
                 
                 # Apply filtering criteria
@@ -113,6 +133,7 @@ class FirebaseMatchmakingService:
                         "city": user.location if user.location else None,
                         "state": user.state
                     } if user.latitude and user.longitude else None,
+                    "distance": self._distance_miles(current_user, user),
                     "matchScore": match['score']
                 })
             
