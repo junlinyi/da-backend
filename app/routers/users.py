@@ -10,6 +10,7 @@ from app.schemas import UserResponse, UserUpdate, ProfileUpdate, PreferencesUpda
 from app.dependencies import verify_firebase_token
 from app.limiter import limiter
 from app.services.age_service import validate_birthdate, record_attestation, BirthdateValidationError
+from app.services.photo_moderation_service import moderate_and_log_photos
 from pydantic import BaseModel, validator
 from datetime import date
 from typing import Optional
@@ -126,6 +127,12 @@ async def update_profile(
 
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+
+    # NSFW scan a changed profile photo BEFORE persisting (scan-on-change).
+    update_data = profile.dict(exclude_unset=True)
+    new_photo = update_data.get("profileImageURL")
+    if new_photo and new_photo != user.profile_image_url:
+        await moderate_and_log_photos(db, user.id, [new_photo])
 
     # Update only the fields that are provided
     for key, value in profile.dict(exclude_unset=True).items():
@@ -455,6 +462,12 @@ async def create_user(
         db_user = result.scalars().first()
         user_data = user.to_user_dict()
         incoming_birthdate = user_data.get('birthdate')
+
+        # NSFW scan BEFORE persisting — blocked photos never reach the DB.
+        existing_id = db_user.id if db_user else None
+        photo_urls = [user_data.get("profile_image_url")]
+        photo_urls += user_data.get("additional_image_urls") or []
+        await moderate_and_log_photos(db, existing_id, photo_urls)
 
         if db_user:
             logger.info(f"[USER CREATE] User already exists, updating: {db_user.id}")
