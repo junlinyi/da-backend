@@ -67,3 +67,15 @@
 **Summary:** Replaced bare `age:int` with stored `birthdate` (age derived on read), enforced 18+ on every write path + DB CHECK, added append-only age_attestations audit trail and admin-reviewed birthdate-correction flow. Migration applied to dev DB. 22 new tests green; full suite 0 regressions vs baseline. As-Built deviations (nullable birthdate, set-once via POST /users/create) documented in AGE_VERIFICATION_SPEC.md.
 **Status:** completed (follow-up: drop legacy `users.age` column after deploy; apply migration to staging/prod)
 ---
+
+## 2026-06-18 Task: Likes tab — premium-gated /likes/* router
+**Branch:** feature/likes-tab-backend
+**Files Modified:**
+- `app/routers/likes.py` — NEW. `/likes/received` (blurred for free, full for premium/unlocked, + city/tag), `/likes/unlock` (1/UTC-day free, unlimited premium, idempotent), `/likes/respond` (like→mutual match via create_match_in_firestore, pass; stamps unlock action/match_id), `/likes/unlock-status`.
+- `alembic/versions/f7a1likes01_add_premium_unlocks_table.py` — NEW. Creates `premium_unlocks` (backs the previously-HELD PremiumUnlock model) AND merges the two open heads (b2c3d4age01 + c4d5e6del01). profile_boosts stays held.
+- `app/main.py` — register the `/likes` router.
+- `tests/test_likes_tab.py` — NEW, 12 DB-backed tests (blur/premium, daily limit, idempotent unlock, non-liker 404, respond like→match/pass→drop, free-requires-unlock, premium-no-unlock).
+
+**Summary:** Implemented the full premium Likes tab the iOS LikesView already expected (the `/likes/*` router didn't exist; the Likes tab 404'd into empty state). Built per user direction after surfacing that no spec existed and the brand doc contradicts the blur paywall. As-built design + open product decisions captured in DatingAppProj/LIKES_TAB_PLAN.md. 12 tests green vs dev Postgres; migration verified by offline SQL render (creates table + merges heads).
+**Status:** completed. Follow-ups: reconcile brand "no blur paywall" vs. this gating; compatibility_score returned null (perf); apply migration to staging/prod. Migration NOT applied to shared dev DB (concurrent-session safety).
+---

@@ -83,6 +83,7 @@ logger = logging.getLogger(__name__)
 
 from app.routers import auth, users, matchmaking, sync, messaging, scheduling, video_calls, reporting, admin
 from app.routers import questionnaire
+from app.routers import likes
 from app.routers import matches
 from app.routers import deletion_reasons
 from app.routers import birthdate_change_requests
@@ -172,6 +173,7 @@ app.include_router(auth.router, prefix="/auth", tags=["Authentication"])
 app.include_router(users.router, prefix="/users", tags=["Users"])
 app.include_router(birthdate_change_requests.router, prefix="/users", tags=["Age Verification"])
 app.include_router(matchmaking.router, prefix="/matchmaking", tags=["Matchmaking"])
+app.include_router(likes.router, tags=["Likes"])  # router defines its own /likes prefix
 app.include_router(sync.router, prefix="/sync", tags=["Sync"])
 app.include_router(messaging.router, prefix="/messaging", tags=["Messaging"])
 app.include_router(scheduling.router, prefix="/scheduling", tags=["Scheduling"])
